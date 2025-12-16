@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Copy of VK Messenger AI",
+  "description": "An application to automate sending variable messages on VKontakte using AI, with a web interface to manage conversations. This initial version focuses on the core sending mechanism and provides educational context for new developers.",
+  "requestFramePermissions": []
+}

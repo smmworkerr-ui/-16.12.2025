@@ -1,0 +1,348 @@
+
+import requests
+import time
+import json
+import os
+import random
+import re
+from backend_core import VK_API_VERSION, log_system, execute_query, generate_random_user_agent
+
+def vk_api_call(method, params, token, user_agent=None):
+    """
+    Выполняет запрос к VK API.
+    KAIZEN: Supports User-Agent for fingerprinting.
+    """
+    if not token or not str(token).strip():
+        return {'error': {'error_msg': 'Internal: Token is empty', 'error_code': 5}}
+    
+    headers = {}
+    if user_agent:
+        headers['User-Agent'] = user_agent
+        
+    try:
+        resp = requests.post(
+            f"https://api.vk.com/method/{method}", 
+            data={**params, 'access_token': token, 'v': VK_API_VERSION}, 
+            headers=headers,
+            timeout=30
+        )
+        return resp.json()
+    except Exception as e:
+        return {'error': {'error_msg': f'Network: {e}', 'error_code': 0}}
+
+def process_spintax(text):
+    """
+    Обрабатывает Spintax формат: {Вариант 1|Вариант 2} ИЛИ {Вариант 1/Вариант 2}
+    Поддерживает вложенность (inside-out).
+    """
+    if not text:
+        return ""
+    
+    pattern = re.compile(r'\{([^{}]+)\}')
+    iterations = 0
+    max_iterations = 100 
+    
+    current_text = text
+    
+    while iterations < max_iterations:
+        match = pattern.search(current_text)
+        if not match:
+            break
+            
+        full_match = match.group(0)
+        content = match.group(1)
+        
+        # Split by | OR /
+        options = re.split(r'[|/]', content)
+        choice = random.choice(options)
+        
+        current_text = current_text[:match.start()] + choice + current_text[match.end():]
+        iterations += 1
+        
+    return current_text
+
+def resolve_identifier(ident, token=None):
+    ident = str(ident).strip().lower().replace('https://vk.com/', '').replace('vk.com/', '').replace('/', '')
+    if not ident: return None
+    if '?' in ident: ident = ident.split('?')[0]
+    if ident.startswith('id') and ident[2:].isdigit(): return ident[2:]
+    if ident.startswith('club') and ident[4:].isdigit(): return f"-{ident[4:]}"
+    if ident.startswith('public') and ident[6:].isdigit(): return f"-{ident[6:]}"
+    if ident.startswith('event') and ident[5:].isdigit(): return f"-{ident[5:]}"
+    if ident.lstrip('-').isdigit(): return ident
+    if token:
+        try:
+            r = vk_api_call('utils.resolveScreenName', {'screen_name': ident}, token)
+            if 'response' in r and r['response']:
+                obj = r['response']
+                if obj['type'] == 'user':
+                    return str(obj['object_id'])
+                elif obj['type'] in ['group', 'page', 'event']:
+                    return f"-{obj['object_id']}"
+        except: pass
+    
+    return None
+
+def fetch_batch_details(token, identifiers):
+    results = {}
+    user_ids = []
+    group_ids = []
+
+    for i in identifiers:
+        si = str(i)
+        if si.startswith('-'):
+            group_ids.append(si[1:])
+        else:
+            user_ids.append(si)
+            
+    chunk_size = 400
+    for i in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[i:i+chunk_size]
+        ids_str = ",".join(chunk)
+        try:
+            resp = vk_api_call('users.get', {'user_ids': ids_str, 'fields': 'photo_100,can_write_private_message'}, token)
+            if 'response' in resp:
+                for u in resp['response']:
+                    results[str(u['id'])] = {
+                        'name': f"{u.get('first_name','')} {u.get('last_name','')}".strip(),
+                        'avatar': u.get('photo_100', ''),
+                        'can_message': u.get('can_write_private_message', 1)
+                    }
+            time.sleep(0.3)
+        except Exception as e:
+            log_system("WARNING", f"Batch users fetch error: {e}")
+
+    for i in range(0, len(group_ids), chunk_size):
+        chunk = group_ids[i:i+chunk_size]
+        ids_str = ",".join(chunk)
+        try:
+            resp = vk_api_call('groups.getById', {'group_ids': ids_str, 'fields': 'photo_100,can_message'}, token)
+            if 'response' in resp:
+                items = resp['response']
+                if isinstance(items, dict): items = items.get('groups', items.get('items', []))
+                for g in items:
+                    gid = str(g['id'])
+                    results[f"-{gid}"] = {
+                        'name': g.get('name', f'Group {gid}'),
+                        'avatar': g.get('photo_100', ''),
+                        'can_message': g.get('can_message', 1)
+                    }
+            time.sleep(0.3)
+        except Exception as e:
+            log_system("WARNING", f"Batch groups fetch error: {e}")
+
+    return results
+
+def fetch_info_universal(vk_api_token, vk_id):
+    res = fetch_batch_details(vk_api_token, [vk_id])
+    return res.get(str(vk_id))
+
+def get_friend_requests(token, out=False, count=100):
+    """Возвращает список ID заявок в друзья (входящие или исходящие)."""
+    try:
+        # out=1 (исходящие), out=0 (входящие)
+        res = vk_api_call('friends.getRequests', {'out': 1 if out else 0, 'count': count, 'need_viewed': 1}, token)
+        if 'response' in res:
+            items = res['response']['items']
+            return [str(x) for x in items]
+    except Exception as e:
+        log_system("ERROR", f"get_friend_requests error: {e}")
+    return []
+
+def check_history_exists(token, user_id):
+    """Проверяет, есть ли сообщения в истории с пользователем."""
+    try:
+        # count=0 возвращает общее количество сообщений
+        res = vk_api_call('messages.getHistory', {'peer_id': user_id, 'count': 0}, token)
+        if 'response' in res:
+            return res['response']['count'] > 0
+    except Exception as e:
+        log_system("WARNING", f"Check history error for {user_id}: {e}")
+    return False
+
+def check_is_friend(token, user_id):
+    """Проверяет, является ли пользователь другом."""
+    if str(user_id).startswith('-'): return False # Groups cannot be friends
+    try:
+        # Используем areFriends для проверки связи
+        res = vk_api_call('friends.areFriends', {'user_ids': user_id}, token)
+        if 'response' in res and len(res['response']) > 0:
+            status = res['response'][0].get('friend_status')
+            return status == 3 # 3 = является другом
+    except Exception as e:
+        log_system("WARNING", f"Check friend error for {user_id}: {e}")
+    return False
+
+def update_account_friends_cache(account_id, token):
+    """Скачивает список друзей (с фото) и обновляет кэш в БД (CSV + JSON)."""
+    try:
+        res = vk_api_call('friends.get', {'count': 10000, 'fields': 'photo_100'}, token)
+        if 'response' in res:
+            items = res['response']['items']
+            
+            # 1. CSV string of IDs (Fast Lookup)
+            friend_ids = [str(x['id']) for x in items]
+            friend_ids_str = ",".join(friend_ids)
+            
+            # 2. JSON list (UI Display)
+            # Create a lightweight list: id, first_name, last_name, photo_100
+            friends_data = []
+            for item in items:
+                friends_data.append({
+                    'id': item['id'],
+                    'first_name': item.get('first_name', ''),
+                    'last_name': item.get('last_name', ''),
+                    'photo_100': item.get('photo_100', '')
+                })
+            friends_json = json.dumps(friends_data, ensure_ascii=False)
+
+            execute_query("UPDATE accounts SET cached_friends_list=?, friends_cache_json=? WHERE id=?", 
+                          (friend_ids_str, friends_json, account_id), commit=True)
+            return len(friend_ids)
+    except Exception as e:
+        log_system("ERROR", f"Failed to update friends cache for acc {account_id}: {e}")
+    return 0
+
+def add_friend(token, user_id):
+    """Отправляет заявку в друзья."""
+    try:
+        res = vk_api_call('friends.add', {'user_id': user_id}, token)
+        return res
+    except Exception as e:
+        log_system("ERROR", f"Add friend error for {user_id}: {e}")
+        return {'error': str(e)}
+
+def get_account_stats_vk(token):
+    """Получает статистику (заявки, друзья) напрямую из ВК."""
+    stats = {'friends': 0, 'incoming': 0, 'outgoing': 0}
+    try:
+        # Friends
+        rf = vk_api_call('friends.get', {'count': 0}, token)
+        if 'response' in rf: stats['friends'] = rf['response']['count']
+        
+        # Incoming
+        ri = vk_api_call('friends.getRequests', {'out': 0, 'count': 0}, token)
+        if 'response' in ri: stats['incoming'] = ri['response']['count']
+        
+        # Outgoing
+        ro = vk_api_call('friends.getRequests', {'out': 1, 'count': 0}, token)
+        if 'response' in ro: stats['outgoing'] = ro['response']['count']
+    except:
+        pass
+    return stats
+
+def accept_friend_request(token, user_id):
+    return vk_api_call('friends.add', {'user_id': user_id}, token)
+
+def delete_friend_request(token, user_id):
+    return vk_api_call('friends.delete', {'user_id': user_id}, token)
+
+def serialize_attachments(attachments):
+    """Преобразует вложения VK в JSON строку для БД."""
+    if not attachments:
+        return None
+    
+    parsed = []
+    for att in attachments:
+        try:
+            t = att['type']
+            item = {}
+            item['type'] = t
+            
+            if t == 'photo':
+                sizes = att['photo']['sizes']
+                if sizes:
+                    best = sorted(sizes, key=lambda x: x['width'] * x['height'])[-1]
+                    item['url'] = best['url']
+                    item['thumb'] = sizes[0]['url'] 
+            elif t == 'sticker':
+                item['url'] = att['sticker']['images'][-1]['url'] 
+            elif t == 'doc':
+                item['title'] = att['doc']['title']
+                item['ext'] = att['doc']['ext']
+                item['url'] = att['doc']['url']
+            elif t == 'video':
+                item['title'] = att['video']['title']
+                if 'image' in att['video']:
+                    item['thumb'] = att['video']['image'][-1]['url']
+                else:
+                    item['thumb'] = ''
+            elif t == 'link':
+                item['url'] = att['link']['url']
+                item['title'] = att['link']['title']
+            elif t == 'audio_message':
+                item['url'] = att['audio_message']['link_mp3']
+                item['duration'] = att['audio_message']['duration']
+                item['waveform'] = att['audio_message'].get('waveform', [])
+            elif t == 'video_message':
+                vm = att['video_message']
+                item['url'] = vm.get('mp4_url') or vm.get('link_mp4') or vm.get('url')
+                item['duration'] = vm.get('duration')
+                item['thumb'] = vm.get('photo_100') or vm.get('photo_200')
+            
+            if not item.get('url') and not item.get('thumb') and not item.get('title'):
+                continue
+
+            parsed.append(item)
+        except Exception as e:
+            continue
+    
+    return json.dumps(parsed)
+
+def parse_full_message_text(item):
+    text_parts = []
+    if item.get('text'): text_parts.append(item['text'])
+    
+    if item.get('reply_message'):
+        reply_text = item['reply_message'].get('text', '[Вложение]')
+        text_parts.append(f"\n╔ Ответ: {reply_text}")
+    if item.get('fwd_messages'):
+        text_parts.append(f"\n[Пересланных сообщений: {len(item['fwd_messages'])}]")
+    return "\n".join(text_parts)
+
+def upload_file_to_vk(token, file_storage, peer_id=None):
+    filename = file_storage.filename.lower()
+    is_image = filename.endswith(('.jpg', '.jpeg', '.png', '.gif'))
+    
+    try:
+        if is_image:
+            res_server = vk_api_call('photos.getMessagesUploadServer', {'peer_id': peer_id} if peer_id else {}, token)
+        else:
+            res_server = vk_api_call('docs.getMessagesUploadServer', {'peer_id': peer_id, 'type': 'doc'} if peer_id else {'type': 'doc'}, token)
+            
+        if 'error' in res_server:
+            raise Exception(f"GetUploadServer error: {res_server['error']['error_msg']}")
+            
+        upload_url = res_server['response']['upload_url']
+        
+        files = {'file' if not is_image else 'photo': (file_storage.filename, file_storage.read(), file_storage.mimetype)}
+        post_resp = requests.post(upload_url, files=files).json()
+        
+        if 'error' in post_resp:
+             raise Exception(f"Upload error: {post_resp['error']}")
+
+        if is_image:
+            save_params = {
+                'server': post_resp['server'],
+                'photo': post_resp['photo'],
+                'hash': post_resp['hash']
+            }
+            save_res = vk_api_call('photos.saveMessagesPhoto', save_params, token)
+            if 'response' in save_res:
+                obj = save_res['response'][0]
+                return f"photo{obj['owner_id']}_{obj['id']}"
+        else:
+            save_params = {'file': post_resp['file']}
+            save_res = vk_api_call('docs.save', save_params, token)
+            if 'response' in save_res:
+                obj = save_res['response']['doc'] if 'doc' in save_res['response'] else save_res['response'][0]
+                return f"doc{obj['owner_id']}_{obj['id']}"
+                
+        if 'error' in save_res:
+             raise Exception(f"Save error: {save_res['error']['error_msg']}")
+             
+    except Exception as e:
+        log_system("ERROR", f"File upload failed: {e}")
+        return None
+        
+    return None

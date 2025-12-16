@@ -1,0 +1,95 @@
+
+import os
+import glob
+import shutil
+from datetime import datetime
+from backend_core import DB_FILE, BACKUP_DIR, execute_query, log_system
+
+# === BACKUP SYSTEM (KAIZEN SECURITY) ===
+
+def ensure_backup_dir():
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+
+def create_backup(manual=False):
+    """
+    Создает безопасный бэкап базы данных используя VACUUM INTO.
+    Это гарантирует целостность данных даже при активной записи (WAL).
+    """
+    try:
+        ensure_backup_dir()
+        
+        # Формат имени: main_YYYY-MM-DD_HH-MM-SS.db
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        backup_name = f"main_{timestamp}.db"
+        backup_path = os.path.join(BACKUP_DIR, backup_name)
+        
+        # Используем SQL VACUUM INTO для создания атомарной копии
+        execute_query(f"VACUUM INTO ?", (backup_path,), commit=True)
+        
+        log_system("INFO", f"💾 Backup created: {backup_name}")
+        
+        # Rotation: Keep last 5
+        rotate_backups()
+        return backup_name
+        
+    except Exception as e:
+        log_system("ERROR", f"Backup failed: {e}")
+        return None
+
+def rotate_backups(keep=5):
+    """Удаляет старые бэкапы, оставляя только последние N."""
+    try:
+        files = glob.glob(os.path.join(BACKUP_DIR, "main_*.db"))
+        # Сортируем по времени создания (новые в конце)
+        files.sort(key=os.path.getmtime)
+        
+        if len(files) > keep:
+            to_delete = files[:-keep]
+            for f in to_delete:
+                os.remove(f)
+                print(f"[CLEANUP] Deleted old backup: {os.path.basename(f)}")
+    except Exception as e:
+        print(f"[CLEANUP ERROR] {e}")
+
+def get_backups_list():
+    """Возвращает список доступных бэкапов."""
+    ensure_backup_dir()
+    files = glob.glob(os.path.join(BACKUP_DIR, "main_*.db"))
+    backups = []
+    for f in files:
+        stats = os.stat(f)
+        backups.append({
+            'filename': os.path.basename(f),
+            'size': stats.st_size,
+            'created_at': stats.st_mtime
+        })
+    # Сортируем: новые сверху
+    backups.sort(key=lambda x: x['created_at'], reverse=True)
+    return backups
+
+def restore_backup(filename):
+    """
+    Восстанавливает БД из бэкапа.
+    ВНИМАНИЕ: Это деструктивная операция для текущей БД.
+    """
+    source = os.path.join(BACKUP_DIR, filename)
+    if not os.path.exists(source):
+        raise Exception("Backup file not found")
+        
+    try:
+        # 1. Удаляем текущие WAL/SHM файлы, чтобы сбросить транзакции
+        wal_file = DB_FILE + "-wal"
+        shm_file = DB_FILE + "-shm"
+        
+        if os.path.exists(wal_file): os.remove(wal_file)
+        if os.path.exists(shm_file): os.remove(shm_file)
+        
+        # 2. Заменяем файл
+        shutil.copy2(source, DB_FILE)
+        
+        log_system("WARNING", f"♻️ DATABASE RESTORED FROM {filename}")
+        return True
+    except Exception as e:
+        log_system("CRITICAL", f"Restore failed: {e}")
+        raise e

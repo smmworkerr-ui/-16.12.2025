@@ -1,0 +1,69 @@
+
+from backend_core import execute_query, log_system, generate_random_user_agent
+
+def repair_db_projects():
+    """
+    Принудительно обновляет старые записи, у которых project_id IS NULL или 0.
+    Это критично после миграции: если project_id пустой, данные не видны на фронте.
+    """
+    try:
+        tables = ['accounts', 'recipients', 'templates', 'conversations', 'campaign_logs']
+        fixed_total = 0
+        
+        print("[REPAIR] Starting orphan check...")
+        
+        for table in tables:
+            # Обновляем NULL, пустые строки и 0 на ID=1 (Default Project)
+            query = f"UPDATE {table} SET project_id = 1 WHERE project_id IS NULL OR project_id = '' OR project_id = 0"
+            res = execute_query(query, commit=True)
+            if res and res > 0:
+                print(f"[REPAIR] Fixed {res} orphans in table '{table}' -> Project 1")
+                fixed_total += res
+        
+        if fixed_total > 0:
+            msg = f"Восстановлено {fixed_total} записей. Теперь они видны в 'Основной' проект."
+            print(f"[REPAIR SUCCESS] {msg}")
+            log_system("WARNING", msg)
+        else:
+            print("[REPAIR] No orphans found. DB is healthy.")
+            
+    except Exception as e:
+        print(f"[REPAIR ERROR] Failed to fix orphans: {e}")
+
+def repair_db_fingerprints():
+    """
+    Generates User-Agent for accounts that don't have one.
+    This ensures safety for existing accounts.
+    """
+    try:
+        accounts = execute_query("SELECT id, user_agent FROM accounts WHERE user_agent IS NULL OR user_agent = ''", fetch_all=True)
+        if not accounts: return
+        
+        updated_count = 0
+        for acc in accounts:
+            ua = generate_random_user_agent()
+            execute_query("UPDATE accounts SET user_agent=? WHERE id=?", (ua, acc['id']), commit=True)
+            updated_count += 1
+            
+        if updated_count > 0:
+            log_system("WARNING", f"Generated User-Agents for {updated_count} existing accounts (Safety Upgrade).")
+            
+    except Exception as e:
+        print(f"[REPAIR ERROR] Failed to fix fingerprints: {e}")
+
+def recover_stale_tasks():
+    """Task Tracker Recovery."""
+    try:
+        # Сброс зависших блокировок
+        query = "UPDATE recipients SET status='queued', locked_by_account_id=NULL, locked_until=NULL WHERE status='reserved'"
+        result = execute_query(query, commit=True)
+        
+        # Сброс статуса locked
+        execute_query("UPDATE recipients SET status='queued' WHERE status='locked'", commit=True)
+        
+        if result and result > 0:
+            msg = f"[TRACKER] System restarted. {result} stale tasks recovered."
+            print(msg)
+            log_system("WARNING", msg)
+    except Exception as e:
+        print(f"[TRACKER ERROR] Recovery failed: {e}")

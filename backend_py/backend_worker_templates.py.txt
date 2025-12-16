@@ -1,0 +1,34 @@
+
+from backend_core import execute_query
+
+def prepare_templates_pool(message_mode, specific_template_ids, custom_text, source_campaign_name, constructor_options, source_subtype, attachments):
+    """Prepares the text generator pool based on mode."""
+    if message_mode == 'custom':
+        return [{'text': custom_text or '', 'type': 'custom'}]
+    elif message_mode == 'constructor':
+        target_folder = source_campaign_name
+        requested_parts = constructor_options.get('parts', [])
+        rows = execute_query("SELECT text, subtype FROM templates WHERE campaign_name=?", (target_folder,), fetch_all=True)
+        if not rows: return None
+        templates_by_subtype = {}
+        for r in rows:
+            st = r['subtype']
+            if st not in templates_by_subtype: templates_by_subtype[st] = []
+            templates_by_subtype[st].append(r['text'])
+        return {'type': 'dynamic_constructor', 'requested_parts': requested_parts, 'data': templates_by_subtype}
+    else:
+        # Template Mode
+        if specific_template_ids and len(specific_template_ids) > 0:
+            placeholders = ','.join('?' * len(specific_template_ids))
+            rows = execute_query(f"SELECT text FROM templates WHERE id IN ({placeholders})", tuple(specific_template_ids), fetch_all=True)
+        elif source_campaign_name:
+            if source_subtype:
+                rows = execute_query("SELECT text FROM templates WHERE campaign_name=? AND subtype=?", (source_campaign_name, source_subtype), fetch_all=True)
+            else:
+                rows = execute_query("SELECT text FROM templates WHERE campaign_name=? AND (subtype='mixed' OR subtype IS NULL OR subtype='')", (source_campaign_name,), fetch_all=True)
+        else:
+            rows = []
+        
+        if not rows and (not attachments or len(attachments) == 0):
+            return None
+        return [{'text': r['text'], 'type': 'mixed'} for r in rows] if rows else [{'text': '', 'type': 'custom'}]

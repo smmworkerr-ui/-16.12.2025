@@ -1,0 +1,44 @@
+
+from backend_core import app, init_db
+from backend_core_repair import recover_stale_tasks
+from backend_core_backup import create_backup
+
+# Импортируем модули API (Роуты регистрируются автоматически при импорте)
+# backend_api.py НЕ ИМПОРТИРУЕМ, так как его функционал разнесен по файлам ниже:
+import backend_api_base          # Базовые (Логи, Бэкапы, Проекты)
+import backend_api_accounts      # Аккаунты
+import backend_api_accounts_import # Импорт аккаунтов
+import backend_api_accounts_friends # Друзья и заявки
+import backend_api_recipients    # Клиенты (CRM)
+import backend_api_chat          # Чаты и сообщения
+import backend_api_chat_sync     # Синхронизация
+import backend_api_templates     # Шаблоны
+import backend_api_analytics     # Аналитика
+import backend_api_campaigns     # Управление кампаниями
+import backend_api_campaigns_launch # Запуск рассылок
+
+import threading
+from backend_worker_maintenance import maintenance_worker
+
+if __name__ == '__main__':
+    print("---------------------------------------")
+    print("   VK MESSENGER AI - BACKEND STARTED   ")
+    print("---------------------------------------")
+    
+    # 1. Инициализация БД
+    init_db()
+    
+    # 2. Авто-бэкап при старте (Безопасность)
+    print("[*] Creating startup backup...")
+    create_backup(manual=False)
+    
+    # 3. Восстановление зависших задач
+    recover_stale_tasks()
+    
+    # 4. Запуск фонового Секретаря (Авто-прием заявок)
+    print("[*] Starting Maintenance Worker (Auto-Accept)...")
+    t = threading.Thread(target=maintenance_worker, daemon=True)
+    t.start()
+    
+    print("SERVER RUNNING AT: http://127.0.0.1:5000")
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False, threaded=True)

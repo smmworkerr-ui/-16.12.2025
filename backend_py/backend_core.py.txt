@@ -1,0 +1,318 @@
+
+import os
+import sqlite3
+import time
+import random
+from flask import Flask, request, make_response, jsonify
+
+# --- КОНФИГУРАЦИЯ ---
+app = Flask(__name__)
+
+# =================================================================
+# 🛡️ SECURITY PATCH: CORS & PRIVATE NETWORK ACCESS
+# =================================================================
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        origin = request.headers.get('Origin', '*')
+        response.headers.add("Access-Control-Allow-Origin", origin)
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type, X-Project-Id, Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        response.headers.add("Access-Control-Allow-Private-Network", "true")
+        response.headers.add("Access-Control-Allow-Credentials", "true")
+        response.headers.add("Access-Control-Max-Age", "86400")
+        return response
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin', '*')
+    response.headers.add("Access-Control-Allow-Origin", origin)
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type, X-Project-Id, Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    response.headers.add("Access-Control-Allow-Private-Network", "true")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response
+
+# =================================================================
+
+VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
+
+# 1. УМНЫЙ ПУТЬ К БАЗЕ
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(BASE_DIR)
+
+DB_NAME = "main.db"
+DB_PATH_CURRENT = os.path.join(BASE_DIR, DB_NAME)
+DB_PATH_PARENT = os.path.join(PARENT_DIR, DB_NAME)
+
+if os.path.exists(DB_PATH_PARENT):
+    DB_FILE = DB_PATH_PARENT
+    print(f"[*] DATABASE FOUND IN PARENT DIR: {DB_FILE}")
+elif os.path.exists(DB_PATH_CURRENT):
+    DB_FILE = DB_PATH_CURRENT
+    print(f"[*] DATABASE FOUND IN CURRENT DIR: {DB_FILE}")
+else:
+    DB_FILE = DB_PATH_CURRENT
+    print(f"[*] NEW DATABASE WILL BE CREATED: {DB_FILE}")
+
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+
+STOP_FLAGS = {}
+ACTIVE_CAMPAIGNS = {}
+CAMPAIGN_TIME_FLAGS = {}
+
+# --- УТИЛИТЫ ---
+
+def generate_random_user_agent():
+    """Generates a random User-Agent string to mimic real browsers."""
+    chrome_version = random.randint(110, 125)
+    windows_version = random.choice(["10.0", "11.0"])
+    
+    uas = [
+        f"Mozilla/5.0 (Windows NT {windows_version}; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Windows NT {windows_version}; Win64; x64; rv:109.0) Gecko/20100101 Firefox/{chrome_version}.0"
+    ]
+    return random.choice(uas)
+
+# --- БАЗА ДАННЫХ ---
+def get_db_connection():
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=60.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL;") 
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        return conn
+    except Exception as e:
+        print(f"[DB CONNECT ERROR] {e}")
+        raise e
+
+def execute_query(query, args=(), fetch_one=False, fetch_all=False, commit=False):
+    conn = None
+    max_retries = 15 
+    retry_delay = 0.2
+
+    for attempt in range(max_retries):
+        try:
+            conn = get_db_connection()
+            cursor = conn.execute(query, args)
+            
+            res = None
+            if commit:
+                conn.commit()
+                res = cursor.rowcount
+                if cursor.lastrowid and cursor.lastrowid > 0:
+                    res = cursor.lastrowid
+            elif fetch_one:
+                res = cursor.fetchone()
+            elif fetch_all:
+                res = cursor.fetchall()
+            else:
+                res = cursor
+                
+            return res
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                sleep_val = (retry_delay * (attempt + 1)) + random.uniform(0.01, 0.1)
+                if conn: conn.close()
+                time.sleep(sleep_val)
+                continue
+            else:
+                print(f"!!! ОШИБКА SQL (Operational): {e} | Query: {query}", flush=True)
+                raise e
+        except Exception as e:
+            print(f"!!! ОШИБКА SQL (General): {e} | Query: {query}", flush=True)
+            raise e
+        finally:
+            if conn:
+                try: conn.close()
+                except: pass
+    
+    raise Exception(f"Database locked after {max_retries} retries")
+
+def log_system(level, message):
+    try:
+        print(f"[{level}] {message}", flush=True)
+        execute_query("INSERT INTO app_logs (level, message) VALUES (?, ?)", (level, str(message)), commit=True)
+    except Exception:
+        pass 
+
+# === ИНИЦИАЛИЗАЦИЯ ===
+
+def init_db():
+    from backend_core_repair import repair_db_projects, repair_db_fingerprints
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        color TEXT DEFAULT '#3b82f6',
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        project_id INTEGER DEFAULT 1,
+        vk_user_id TEXT, 
+        name TEXT, 
+        avatar TEXT, 
+        access_token TEXT, 
+        status TEXT, 
+        error_details TEXT,
+        group_name TEXT DEFAULT '',
+        cleanup_enabled INTEGER DEFAULT 0,
+        cleanup_days INTEGER DEFAULT 30,
+        auto_accept_enabled INTEGER DEFAULT 0,
+        auto_accept_msg TEXT DEFAULT '',
+        auto_accept_delay_min INTEGER DEFAULT 1,
+        auto_accept_delay_max INTEGER DEFAULT 5,
+        skip_dialog_exists INTEGER DEFAULT 1,
+        auto_accept_skip_msg INTEGER DEFAULT 1,
+        tags TEXT,
+        day_limit INTEGER DEFAULT 20,
+        messages_sent_today INTEGER DEFAULT 0,
+        last_activity_at INTEGER DEFAULT 0,
+        health_score INTEGER DEFAULT 100,
+        kamikaze_mode INTEGER DEFAULT 0,
+        recipients_history_today TEXT DEFAULT '',
+        cached_friends_list TEXT DEFAULT '',
+        friends_cache_json TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        login TEXT DEFAULT '',
+        password TEXT DEFAULT ''
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS recipients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        project_id INTEGER DEFAULT 1,
+        vk_user_id TEXT UNIQUE, 
+        name TEXT, 
+        avatar TEXT, 
+        profile_url TEXT, 
+        notes TEXT, 
+        status TEXT DEFAULT 'new', 
+        campaign_name TEXT,
+        campaign_type TEXT,
+        can_message INTEGER DEFAULT 1,
+        crm_status TEXT DEFAULT 'new',
+        tags TEXT,
+        locked_by_account_id INTEGER DEFAULT NULL,
+        locked_until TIMESTAMP DEFAULT NULL
+    )""")
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        project_id INTEGER DEFAULT 1,
+        name TEXT, 
+        text TEXT,
+        campaign_name TEXT DEFAULT 'Общее',
+        subtype TEXT DEFAULT 'mixed'
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY, 
+        project_id INTEGER DEFAULT 1,
+        owner_id TEXT, 
+        peer_id TEXT, 
+        name TEXT, 
+        avatar TEXT, 
+        last_message TEXT, 
+        pinned INTEGER DEFAULT 0, 
+        unread_count INTEGER DEFAULT 0,
+        campaign_name TEXT,
+        campaign_type TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY,
+        conversation_id TEXT,
+        sender TEXT,
+        text TEXT,
+        date INTEGER,
+        attachments TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT,
+        remind_at INTEGER,
+        note TEXT,
+        created_at INTEGER
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS campaign_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        project_id INTEGER DEFAULT 1,
+        campaign_id TEXT, 
+        timestamp TEXT, 
+        peer_id TEXT, 
+        status TEXT, 
+        message TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS app_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP, 
+        level TEXT, 
+        message TEXT
+    )""")
+    
+    migrations = [
+        "ALTER TABLE messages ADD COLUMN attachments TEXT",
+        "ALTER TABLE recipients ADD COLUMN crm_status TEXT DEFAULT 'new'",
+        "ALTER TABLE recipients ADD COLUMN tags TEXT",
+        "ALTER TABLE templates ADD COLUMN campaign_name TEXT DEFAULT 'Общее'",
+        "ALTER TABLE templates ADD COLUMN subtype TEXT DEFAULT 'mixed'",
+        "ALTER TABLE accounts ADD COLUMN group_name TEXT",
+        "ALTER TABLE accounts ADD COLUMN cleanup_enabled INTEGER DEFAULT 0",
+        "ALTER TABLE accounts ADD COLUMN cleanup_days INTEGER DEFAULT 30",
+        "ALTER TABLE accounts ADD COLUMN auto_accept_enabled INTEGER DEFAULT 0",
+        "ALTER TABLE accounts ADD COLUMN auto_accept_msg TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN auto_accept_delay_min INTEGER DEFAULT 1",
+        "ALTER TABLE accounts ADD COLUMN auto_accept_delay_max INTEGER DEFAULT 5",
+        "ALTER TABLE accounts ADD COLUMN skip_dialog_exists INTEGER DEFAULT 1",
+        "ALTER TABLE accounts ADD COLUMN auto_accept_skip_msg INTEGER DEFAULT 1",
+        "ALTER TABLE accounts ADD COLUMN tags TEXT",
+        "ALTER TABLE accounts ADD COLUMN day_limit INTEGER DEFAULT 20",
+        "ALTER TABLE accounts ADD COLUMN messages_sent_today INTEGER DEFAULT 0",
+        "ALTER TABLE accounts ADD COLUMN last_activity_at INTEGER DEFAULT 0",
+        "ALTER TABLE accounts ADD COLUMN health_score INTEGER DEFAULT 100",
+        "ALTER TABLE accounts ADD COLUMN kamikaze_mode INTEGER DEFAULT 0",
+        "ALTER TABLE accounts ADD COLUMN recipients_history_today TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN cached_friends_list TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN friends_cache_json TEXT DEFAULT ''",
+        "ALTER TABLE recipients ADD COLUMN locked_by_account_id INTEGER DEFAULT NULL",
+        "ALTER TABLE recipients ADD COLUMN locked_until TIMESTAMP DEFAULT NULL",
+        "ALTER TABLE accounts ADD COLUMN user_agent TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN login TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN project_id INTEGER DEFAULT 1",
+        "ALTER TABLE recipients ADD COLUMN project_id INTEGER DEFAULT 1",
+        "ALTER TABLE templates ADD COLUMN project_id INTEGER DEFAULT 1",
+        "ALTER TABLE conversations ADD COLUMN project_id INTEGER DEFAULT 1",
+        "ALTER TABLE campaign_logs ADD COLUMN project_id INTEGER DEFAULT 1"
+    ]
+    
+    for mig in migrations:
+        try: c.execute(mig)
+        except: pass
+
+    try:
+        check_proj = c.execute("SELECT count(*) FROM projects").fetchone()[0]
+        if check_proj == 0:
+            c.execute("INSERT INTO projects (id, name, color) VALUES (1, 'Основной', '#3b82f6')")
+            print("[INIT] Создан проект по умолчанию 'Основной' (ID: 1)")
+    except Exception as e:
+        print(f"[INIT ERROR] Ошибка проверки проектов: {e}")
+
+    conn.commit()
+    conn.close()
+    
+    repair_db_projects()
+    repair_db_fingerprints()
+    
+    print(f"[+] БД Инициализирована")

@@ -1,0 +1,118 @@
+
+from flask import request, jsonify
+from backend_core import app, execute_query
+from backend_tools import vk_api_call, process_spintax
+import random
+
+# =========================
+# TEMPLATES
+# =========================
+@app.route('/api/templates', methods=['GET', 'POST'])
+def api_templates():
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    if request.method == 'POST':
+        d = request.json
+        c_name = d.get('campaign_name', 'Общее')
+        subtype = d.get('subtype', 'mixed')
+        if not c_name: c_name = 'Общее'
+        execute_query("INSERT INTO templates (name, text, campaign_name, subtype, project_id) VALUES (?, ?, ?, ?, ?)", 
+                     (d.get('name'), d.get('text'), c_name, subtype, project_id), commit=True)
+        return jsonify({'message': 'Created'})
+    
+    rows = execute_query("SELECT * FROM templates WHERE project_id=? ORDER BY campaign_name, name", (project_id,), fetch_all=True)
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/templates/<int:id>', methods=['PUT', 'DELETE'])
+def mod_template(id):
+    if request.method == 'DELETE': 
+        execute_query("DELETE FROM templates WHERE id=?", (id,), commit=True)
+    else: 
+        d = request.json
+        c_name = d.get('campaign_name', 'Общее')
+        subtype = d.get('subtype', 'mixed')
+        execute_query("UPDATE templates SET name=?, text=?, campaign_name=?, subtype=? WHERE id=?", 
+                     (d['name'], d['text'], c_name, subtype, id), commit=True)
+    return jsonify({})
+
+@app.route('/api/templates/delete-campaign', methods=['POST'])
+def delete_template_campaign():
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        c_name = request.json.get('campaign_name')
+        if not c_name:
+            return jsonify({'error': 'Campaign name required'}), 400
+        count = execute_query("DELETE FROM templates WHERE campaign_name=? AND project_id=?", (c_name, project_id), commit=True)
+        return jsonify({'message': 'Deleted', 'count': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/templates/rename-campaign', methods=['POST'])
+def rename_template_campaign():
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        old_name = request.json.get('old_name')
+        new_name = request.json.get('new_name')
+        if not old_name or not new_name:
+            return jsonify({'error': 'Names required'}), 400
+        
+        # Only update templates, preserving history in recipients/conversations
+        execute_query("UPDATE templates SET campaign_name=? WHERE campaign_name=? AND project_id=?", (new_name, old_name, project_id), commit=True)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/templates/rename-subtype', methods=['POST'])
+def rename_template_subtype():
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        c_name = request.json.get('campaign_name')
+        old_sub = request.json.get('old_subtype')
+        new_sub = request.json.get('new_subtype')
+        
+        execute_query("UPDATE templates SET subtype=? WHERE campaign_name=? AND subtype=? AND project_id=?", (new_sub, c_name, old_sub, project_id), commit=True)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/templates/test-send', methods=['POST'])
+def test_send_template():
+    """Отправляет тестовое сообщение (рандомизированное) самому себе (в Избранное)."""
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        text = request.json.get('text', '')
+        if not text:
+            return jsonify({'error': 'Text is empty'}), 400
+            
+        # 1. Process Spintax
+        final_text = process_spintax(text)
+        final_text = final_text.replace('{имя}', 'Тест')
+        
+        # 2. Get active account from this project
+        acc = execute_query("SELECT access_token, vk_user_id FROM accounts WHERE status='OK' AND project_id=? LIMIT 1", (project_id,), fetch_one=True)
+        if not acc:
+            return jsonify({'error': 'No active account found in this project to send test message'}), 400
+            
+        token = acc['access_token']
+        # Peer ID = self ID
+        peer_id = acc['vk_user_id']
+        
+        # 3. Send
+        res = vk_api_call('messages.send', {
+            'peer_id': peer_id, 
+            'message': final_text, 
+            'random_id': random.getrandbits(31)
+        }, token)
+        
+        if 'error' in res:
+            return jsonify({'error': res['error']['error_msg']}), 400
+            
+        return jsonify({
+            'status': 'sent', 
+            'to': peer_id, 
+            'processed_text': final_text,
+            'message': f"Отправлено в Избранное аккаунта ID {peer_id}"
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

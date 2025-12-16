@@ -1,0 +1,191 @@
+
+from flask import request, jsonify
+import threading
+from datetime import datetime
+from backend_core import app, execute_query, log_system, ACTIVE_CAMPAIGNS
+from backend_tools import resolve_identifier, fetch_batch_details
+from backend_worker import run_campaign_manager
+
+def extract_ids_from_text(text):
+    lines = text.split('\n')
+    extracted = []
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        if ';' in line: line = line.split(';')[0]
+        elif ',' in line: line = line.split(',')[0]
+        line = line.replace('"', '').replace("'", "")
+        if len(line) < 3: continue 
+        extracted.append(line)
+    return "\n".join(extracted)
+
+@app.route('/api/campaigns/import-recipients', methods=['POST'])
+def import_recipients_from_file():
+    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    try:
+        content = ""
+        try: content = file.read().decode('utf-8')
+        except UnicodeDecodeError:
+            file.seek(0)
+            content = file.read().decode('cp1251', errors='ignore')
+        parsed_ids = extract_ids_from_text(content)
+        return jsonify({'status': 'ok', 'text': parsed_ids, 'count': len(parsed_ids.split('\n')) if parsed_ids else 0})
+    except Exception as e:
+        return jsonify({'error': f"Import failed: {str(e)}"}), 500
+
+# =========================
+# CAMPAIGN LAUNCH
+# =========================
+@app.route('/api/start-bulk-campaign', methods=['POST'])
+def start_bulk():
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    d = request.json
+    c_name = d.get('campaign_name', 'General').strip()
+    if not c_name: c_name = 'General'
+    
+    if c_name in ACTIVE_CAMPAIGNS:
+        return jsonify({'error': 'Campaign already running'}), 400
+
+    # Tech Params
+    execution_mode = d.get('execution_mode', 'sequential')
+    delay_mode = d.get('delay_mode', 'manual')
+    delay_min = float(d.get('delay_min', 5))
+    delay_max = float(d.get('delay_max', 15))
+    work_start = int(d.get('work_start', 0))
+    work_end = int(d.get('work_end', 24))
+    skip_if_dialog_exists = d.get('skip_if_dialog_exists', False)
+    reset_status_new = d.get('reset_status_new', False)
+    add_friends = d.get('add_friends', False)
+    start_at = d.get('start_at') 
+
+    # Message Params
+    custom_text = d.get('custom_text')
+    message_mode = d.get('message_mode', 'template') 
+    spec_accs = d.get('specific_account_ids') or []
+    spec_tpls = d.get('specific_template_ids')
+    attachments = d.get('attachments', []) 
+    
+    source_campaign_name = d.get('source_campaign_name')
+    source_subtype = d.get('source_subtype')
+    constructor_options = d.get('constructor_options')
+    
+    if not spec_accs:
+        rows = execute_query("SELECT id FROM accounts WHERE status='OK' AND project_id=?", (project_id,), fetch_all=True)
+        spec_accs = [r['id'] for r in rows]
+
+    # STORE PROJECT ID IN ACTIVE CONFIG
+    ACTIVE_CAMPAIGNS[c_name] = {
+        'project_id': project_id,
+        'accounts': spec_accs,
+        'execution_mode': execution_mode,
+        'delay_mode': delay_mode,
+        'delay_min': delay_min,
+        'delay_max': delay_max,
+        'work_start': work_start,
+        'work_end': work_end,
+        'skip_if_dialog_exists': skip_if_dialog_exists,
+        'add_friends': add_friends
+    }
+
+    # --- RECIPIENT PROCESSING (Standard) ---
+    raw_ids = d.get('ids_text', '').split('\n')
+    c_type = d.get('campaign_type', 'General')
+    recipient_mode = d.get('recipient_mode', 'auto') 
+    
+    acc = execute_query("SELECT access_token FROM accounts WHERE status='OK' AND project_id=? LIMIT 1", (project_id,), fetch_one=True)
+    token = acc['access_token'] if acc else None
+    
+    existing = execute_query("SELECT vk_user_id, status, name, avatar FROM recipients WHERE project_id=?", (project_id,), fetch_all=True)
+    exist_map = {r['vk_user_id']: r for r in existing}
+    
+    valid_ids = []
+    to_fetch = set()
+    processed_ids = set()
+    
+    count = 0
+    skipped = 0
+
+    log_system("INFO", f"Processing {len(raw_ids)} lines for '{c_name}'...")
+
+    for line in raw_ids:
+        line = line.strip()
+        if not line: continue
+        
+        vk_id = resolve_identifier(line, token)
+        if not vk_id: 
+            log_system("WARNING", f"Skipped line '{line}': Could not resolve ID.")
+            continue
+
+        if recipient_mode == 'users':
+            if vk_id.startswith('-'): vk_id = vk_id[1:]
+        elif recipient_mode == 'groups':
+            if not vk_id.startswith('-'): vk_id = f"-{vk_id}"
+        
+        if vk_id in processed_ids: 
+            # Silent skip duplicates in same batch
+            continue
+            
+        processed_ids.add(vk_id)
+        valid_ids.append(vk_id)
+        
+        if vk_id not in exist_map:
+            to_fetch.add(vk_id)
+        else:
+            st = exist_map[vk_id]['status']
+            if st in ['blocked', 'blacklist']:
+                log_system("WARNING", f"Skipped {vk_id}: Status is {st}")
+                skipped += 1
+                continue 
+            r = exist_map[vk_id]
+            if not r['name'] or r['name'] == 'Community' or r['name'].startswith('User ') or r['name'].startswith('Group '): 
+                to_fetch.add(vk_id)
+
+    users_data = {}
+    if token and to_fetch:
+        users_data = fetch_batch_details(token, list(to_fetch))
+
+    for vk_id in valid_ids:
+        if vk_id in exist_map and exist_map[vk_id]['status'] in ['blocked', 'blacklist']:
+            continue
+
+        fetched_info = users_data.get(vk_id)
+        can_msg = 1
+        if fetched_info and 'can_message' in fetched_info: can_msg = fetched_info['can_message']
+        
+        if not fetched_info:
+            if vk_id in exist_map:
+                 fetched_info = {'name': exist_map[vk_id]['name'], 'avatar': exist_map[vk_id]['avatar']}
+            else:
+                 fetched_info = {'name': f"User {vk_id}", 'avatar': ''}
+
+        if vk_id in exist_map:
+            if reset_status_new:
+                execute_query("UPDATE recipients SET status='queued', campaign_name=?, campaign_type=?, name=?, avatar=?, can_message=?, crm_status='new' WHERE vk_user_id=? AND project_id=?", 
+                            (c_name, c_type, fetched_info['name'], fetched_info['avatar'], can_msg, vk_id, project_id), commit=True)
+            else:
+                execute_query("UPDATE recipients SET status='queued', campaign_name=?, campaign_type=?, name=?, avatar=?, can_message=? WHERE vk_user_id=? AND project_id=?", 
+                            (c_name, c_type, fetched_info['name'], fetched_info['avatar'], can_msg, vk_id, project_id), commit=True)
+            count += 1
+        else:
+            execute_query("INSERT INTO recipients (vk_user_id, name, avatar, profile_url, status, campaign_name, campaign_type, can_message, crm_status, project_id) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 'new', ?)",
+                        (vk_id, fetched_info['name'], fetched_info['avatar'], f"https://vk.com/{'club' if vk_id.startswith('-') else 'id'}{vk_id.replace('-','')}", c_name, c_type, can_msg, project_id), commit=True)
+            count += 1
+
+    # Clean Locks
+    execute_query("UPDATE recipients SET locked_by_account_id=NULL, locked_until=NULL, status='queued' WHERE campaign_name=? AND status='reserved' AND project_id=?", (c_name, project_id), commit=True)
+    execute_query("UPDATE recipients SET locked_by_account_id=NULL, locked_until=NULL, status='queued' WHERE locked_until < datetime('now') AND status='reserved'", commit=True)
+
+    log_msg = f"$Campaign '{c_name}' queued: {count}. Skipped: {skipped}. Project: {project_id}. Mode: {execution_mode.upper()}"
+    if start_at:
+        dt = datetime.fromtimestamp(start_at)
+        log_msg += f" Scheduled for {dt.strftime('%H:%M:%S')}"
+    log_system("INFO", log_msg)
+    
+    threading.Thread(target=run_campaign_manager, args=(
+        c_name, spec_tpls, custom_text, message_mode, source_campaign_name, constructor_options, attachments, source_subtype, start_at
+    )).start()
+    
+    return jsonify({'message': f'Queued {count} recipients', 'count': count})

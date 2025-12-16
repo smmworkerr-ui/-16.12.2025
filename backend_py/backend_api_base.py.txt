@@ -1,0 +1,161 @@
+
+from flask import jsonify, request
+from datetime import datetime
+from backend_core import app, execute_query, log_system
+from backend_core_backup import get_backups_list, create_backup, restore_backup
+
+# =========================
+# СЛУЖЕБНЫЕ ЭНДПОИНТЫ (System & Logs)
+# =========================
+
+@app.route('/api/health-check', methods=['GET'])
+def health_check():
+    return jsonify({'ok': True, 'message': 'Server is running'})
+
+@app.route('/api/app-logs', methods=['GET'])
+def get_app_logs():
+    try:
+        rows = execute_query("SELECT * FROM app_logs ORDER BY id DESC LIMIT 100", fetch_all=True)
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/campaign-logs', methods=['GET'])
+def get_campaign_logs():
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        rows = execute_query("SELECT * FROM campaign_logs WHERE project_id=? ORDER BY id DESC LIMIT 100", (project_id,), fetch_all=True)
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/server-time', methods=['GET'])
+def get_server_time():
+    now = datetime.now()
+    return jsonify({
+        'current_time': now.strftime("%H:%M"),
+        'timestamp': int(now.timestamp())
+    })
+
+# =========================
+# PROJECTS (WORKSPACES)
+# =========================
+
+@app.route('/api/projects', methods=['GET', 'POST'])
+def api_projects():
+    if request.method == 'GET':
+        rows = execute_query("SELECT * FROM projects ORDER BY id ASC", fetch_all=True)
+        return jsonify([dict(r) for r in rows])
+    
+    if request.method == 'POST':
+        name = request.json.get('name')
+        color = request.json.get('color', '#3b82f6')
+        if not name:
+            return jsonify({'error': 'Name required'}), 400
+            
+        execute_query("INSERT INTO projects (name, color) VALUES (?, ?)", (name, color), commit=True)
+        return jsonify({'status': 'ok'})
+
+@app.route('/api/projects/<int:id>', methods=['DELETE'])
+def delete_project(id):
+    if id == 1:
+        return jsonify({'error': 'Cannot delete default project'}), 400
+        
+    # Check if has data
+    accs = execute_query("SELECT count(*) as c FROM accounts WHERE project_id=?", (id,), fetch_one=True)['c']
+    if accs > 0:
+        return jsonify({'error': f'Cannot delete: Project has {accs} accounts linked.'}), 400
+        
+    execute_query("DELETE FROM projects WHERE id=?", (id,), commit=True)
+    return jsonify({'status': 'deleted'})
+
+# =========================
+# BACKUP & RECOVERY
+# =========================
+
+@app.route('/api/backups', methods=['GET'])
+def api_get_backups():
+    try:
+        backups = get_backups_list()
+        return jsonify(backups)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/backups/create', methods=['POST'])
+def api_create_backup():
+    try:
+        filename = create_backup(manual=True)
+        if filename:
+            return jsonify({'status': 'ok', 'filename': filename})
+        else:
+            return jsonify({'error': 'Backup failed (check logs)'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/backups/restore', methods=['POST'])
+def api_restore_backup():
+    try:
+        filename = request.json.get('filename')
+        if not filename:
+            return jsonify({'error': 'Filename required'}), 400
+            
+        restore_backup(filename)
+        return jsonify({'status': 'ok', 'message': 'Database restored. Please refresh page.'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# =========================
+# CRM REPAIR
+# =========================
+
+@app.route('/api/repair-crm', methods=['POST'])
+def repair_crm():
+    """
+    Optimized: Scans conversations and restores missing Recipients using JOIN.
+    """
+    try:
+        missing_rows = execute_query("""
+            SELECT c.peer_id, c.name, c.avatar, c.campaign_name, c.project_id
+            FROM conversations c
+            LEFT JOIN recipients r ON c.peer_id = r.vk_user_id AND c.project_id = r.project_id
+            WHERE r.id IS NULL
+        """, fetch_all=True)
+        
+        restored_count = 0
+        
+        for row in missing_rows:
+            try:
+                peer_id = str(row['peer_id'])
+                if not peer_id: continue
+                
+                camp_raw = row['campaign_name']
+                final_camp = 'Restored'
+                
+                if camp_raw:
+                    parts = [x.strip() for x in str(camp_raw).split('|') if x.strip()]
+                    real_campaigns = [p for p in parts if p != '🗄️ Прошлые кампании' and p != 'Manual']
+                    if real_campaigns:
+                        final_camp = real_campaigns[-1]
+                    else:
+                        final_camp = 'Restored'
+                
+                name = row['name'] or f"User {peer_id}"
+                avatar = row['avatar'] or ''
+                proj_id = row['project_id'] or 1
+                
+                execute_query("""
+                    INSERT INTO recipients 
+                    (vk_user_id, name, avatar, profile_url, status, campaign_name, crm_status, can_message, project_id)
+                    VALUES (?, ?, ?, ?, 'chat', ?, 'progress', 1, ?)
+                """, (peer_id, name, avatar, f"https://vk.com/id{peer_id}", final_camp, proj_id), commit=True)
+                
+                restored_count += 1
+            except Exception as insert_err:
+                print(f"[REPAIR SKIP] Failed to restore {row.get('peer_id')}: {insert_err}")
+                continue
+                
+        return jsonify({'status': 'ok', 'restored': restored_count})
+        
+    except Exception as e:
+        print(f"[REPAIR CRITICAL ERROR] {e}")
+        return jsonify({'error': str(e)}), 500

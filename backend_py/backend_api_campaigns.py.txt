@@ -1,0 +1,112 @@
+
+from flask import request, jsonify
+from backend_core import app, execute_query, log_system, STOP_FLAGS, ACTIVE_CAMPAIGNS
+
+# =========================
+# CAMPAIGN CONTROL
+# =========================
+@app.route('/api/campaigns/active', methods=['GET'])
+def get_active_campaigns():
+    project_id = request.headers.get('X-Project-Id', 1)
+    active_list = []
+    
+    for name, config in ACTIVE_CAMPAIGNS.items():
+        # Check Isolation: Does this campaign belong to the current project?
+        # If config has no project_id (legacy), show it everywhere or filter by Recipients.
+        camp_project_id = config.get('project_id')
+        
+        # Strict Match: If active campaign has a project_id, it must match.
+        if camp_project_id and str(camp_project_id) != str(project_id):
+            continue
+            
+        # Fallback for older running campaigns: Check recipients DB
+        if not camp_project_id:
+            count = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND project_id=?", (name, project_id), fetch_one=True)['c']
+            if count == 0: continue
+
+        total = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND project_id=?", (name, project_id), fetch_one=True)['c']
+        sent = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND status='sent' AND project_id=?", (name, project_id), fetch_one=True)['c']
+        queued = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND status='queued' AND project_id=?", (name, project_id), fetch_one=True)['c']
+        
+        acc_ids = config.get('accounts', [])
+        acc_details = []
+        if acc_ids:
+            placeholders = ','.join('?' * len(acc_ids))
+            rows = execute_query(f"SELECT id, name, avatar FROM accounts WHERE id IN ({placeholders})", tuple(acc_ids), fetch_all=True)
+            acc_details = [dict(r) for r in rows]
+
+        active_list.append({
+            'name': name,
+            'total': total,
+            'sent': sent,
+            'queued': queued,
+            'config': {
+                'delay_mode': config.get('delay_mode', 'manual'),
+                'delay_min': config.get('delay_min'),
+                'delay_max': config.get('delay_max'),
+                'work_start': config.get('work_start'),
+                'work_end': config.get('work_end'),
+                'skip_if_dialog_exists': config.get('skip_if_dialog_exists'),
+                'execution_mode': config.get('execution_mode', 'sequential')
+            },
+            'accounts': acc_details
+        })
+        
+    return jsonify(active_list)
+
+@app.route('/api/campaigns/queue', methods=['GET'])
+def get_campaign_queue():
+    project_id = request.headers.get('X-Project-Id', 1)
+    name = request.args.get('campaign_name')
+    if not name: return jsonify([])
+    rows = execute_query("SELECT id, name, avatar, vk_user_id FROM recipients WHERE campaign_name=? AND status='queued' AND project_id=? LIMIT 100", (name, project_id), fetch_all=True)
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/campaigns/skip-recipient', methods=['POST'])
+def skip_campaign_recipient():
+    try:
+        rec_id = request.json.get('id')
+        execute_query("UPDATE recipients SET status='skipped' WHERE id=?", (rec_id,), commit=True)
+        return jsonify({'status': 'skipped'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/campaigns/update-settings', methods=['POST'])
+def update_campaign_settings():
+    d = request.json
+    name = d.get('campaign_name')
+    if not name or name not in ACTIVE_CAMPAIGNS:
+        return jsonify({'error': 'Campaign not active'}), 404
+        
+    config = ACTIVE_CAMPAIGNS[name]
+    if 'delay_min' in d: config['delay_min'] = float(d['delay_min'])
+    if 'delay_max' in d: config['delay_max'] = float(d['delay_max'])
+    if 'work_start' in d: config['work_start'] = int(d['work_start'])
+    if 'work_end' in d: config['work_end'] = int(d['work_end'])
+    if 'skip_if_dialog_exists' in d: config['skip_if_dialog_exists'] = bool(d['skip_if_dialog_exists'])
+    
+    log_system("INFO", f"Updated settings for '{name}': {d}")
+    return jsonify({'status': 'updated'})
+
+@app.route('/api/campaigns/exclude-account', methods=['POST'])
+def remove_campaign_account():
+    d = request.json
+    name = d.get('campaign_name')
+    acc_id = d.get('account_id')
+    if not name or name not in ACTIVE_CAMPAIGNS: return jsonify({'error': 'Campaign not active'}), 404
+    config = ACTIVE_CAMPAIGNS[name]
+    current_accs = config.get('accounts', [])
+    if acc_id in current_accs:
+        current_accs.remove(acc_id)
+        config['accounts'] = current_accs
+        log_system("INFO", f"Removed account ID {acc_id} from campaign '{name}'")
+        return jsonify({'status': 'removed'})
+    return jsonify({'error': 'Account not found in campaign'}), 404
+
+@app.route('/api/mission/stop', methods=['POST'])
+def stop_mission():
+    c_name = request.json.get('campaign_name')
+    if c_name:
+        STOP_FLAGS[c_name] = True
+        log_system("WARNING", f"Stop signal received for '{c_name}'")
+    return jsonify({'status': 'stopping'})

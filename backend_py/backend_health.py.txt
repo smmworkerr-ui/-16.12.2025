@@ -1,0 +1,77 @@
+
+import time
+import random
+from backend_core import execute_query, log_system
+
+def update_account_health(account_id, event_type):
+    """
+    Пересчитывает здоровье аккаунта на основе события и времени простоя.
+    event_type: 'sent' | 'error' | 'captcha' | 'flood' | 'check'
+    """
+    try:
+        # 1. Получаем текущее состояние
+        row = execute_query("SELECT health_score, last_activity_at FROM accounts WHERE id=?", (account_id,), fetch_one=True)
+        if not row:
+            return 100
+            
+        current_hp = row['health_score'] if row['health_score'] is not None else 100
+        last_ts = row['last_activity_at'] or 0
+        now = int(time.time())
+        
+        # 2. Логика Регенерации (Regen)
+        # Если была активность, считаем часы простоя
+        if last_ts > 0:
+            seconds_passed = now - last_ts
+            hours_passed = int(seconds_passed / 3600)
+            
+            if hours_passed > 0 and current_hp < 100:
+                regen_amount = hours_passed * 5
+                current_hp = min(100, current_hp + regen_amount)
+                # Если прошло много времени, можно считать это полным восстановлением
+                if hours_passed > 12: 
+                    current_hp = 100
+
+        # 3. Логика Урона (Damage)
+        damage = 0
+        if event_type == 'sent':
+            damage = 1 # Стандартная цена сообщения
+        elif event_type == 'error':
+            damage = 5 # Ошибка API
+        elif event_type == 'flood':
+            damage = 15 # Too many requests
+        elif event_type == 'captcha':
+            damage = 30 # Серьезное подозрение
+            
+        current_hp -= damage
+        current_hp = max(0, min(100, current_hp))
+        
+        # 4. Сохранение
+        # last_activity_at обновляется только при активных действиях, не при 'check'
+        if event_type != 'check':
+            execute_query("UPDATE accounts SET health_score=?, last_activity_at=? WHERE id=?", (int(current_hp), now, account_id), commit=True)
+        else:
+            execute_query("UPDATE accounts SET health_score=? WHERE id=?", (int(current_hp), account_id), commit=True)
+            
+        return current_hp
+
+    except Exception as e:
+        print(f"[HEALTH ERROR] Acc {account_id}: {e}")
+        return 0
+
+def get_adaptive_delay(health_score, base_min=60, base_max=120):
+    """
+    Рассчитывает задержку на основе здоровья.
+    SILENT MODE DEFAULT: 60-120 seconds base.
+    """
+    if health_score > 80:
+        # Зеленая зона: "Тихий ход" (60-120s)
+        return random.uniform(base_min, base_max)
+    elif health_score > 50:
+        # Желтая зона: x2 замедление (120-240s)
+        return random.uniform(base_min * 2, base_max * 2)
+    elif health_score > 20:
+        # Оранжевая зона: x5 замедление (5-10 мин)
+        return random.uniform(300, 600)
+    else:
+        # Красная зона: критическое охлаждение (10-20 мин)
+        return random.uniform(600, 1200)

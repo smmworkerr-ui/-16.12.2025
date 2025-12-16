@@ -1,0 +1,224 @@
+
+from flask import request, jsonify, make_response
+import threading
+import csv
+import io
+import json
+from backend_core import app, execute_query, log_system
+from backend_tools import resolve_identifier, fetch_info_universal
+
+# CRM STATUS CONSTANTS
+CRM_STATUSES = {
+    'new': 'Новый',
+    'progress': 'В работе',
+    'hot': 'Лид',
+    'success': 'Клиент',
+    'reject': 'Отказ'
+}
+
+@app.route('/api/recipients', methods=['GET', 'POST'])
+def api_recipients():
+    project_id = request.headers.get('X-Project-Id', 1)
+
+    if request.method == 'POST':
+        ident = request.json.get('identifier')
+        acc = execute_query("SELECT access_token FROM accounts WHERE status='OK' AND project_id=? LIMIT 1", (project_id,), fetch_one=True)
+        token = acc['access_token'] if acc else None
+        
+        vk_id = resolve_identifier(ident, token) or ident
+        if not vk_id: return jsonify({'error': 'Invalid ID'}), 400
+        
+        info = {'name': f'User {vk_id}', 'avatar': '', 'can_message': 1}
+        if token:
+            fetched = fetch_info_universal(token, vk_id)
+            if fetched: info = fetched
+        
+        # Check existence ONLY within this project
+        exist = execute_query("SELECT id FROM recipients WHERE vk_user_id=? AND project_id=?", (vk_id, project_id), fetch_one=True)
+        rec_id = None
+        
+        if exist:
+            execute_query("UPDATE recipients SET name=?, avatar=?, status='queued' WHERE id=?", 
+                         (info['name'], info['avatar'], exist['id']), commit=True)
+            rec_id = exist['id']
+        else:
+            cur = execute_query("INSERT INTO recipients (vk_user_id, name, avatar, profile_url, status, campaign_name, campaign_type, can_message, crm_status, project_id) VALUES (?, ?, ?, ?, 'queued', 'Manual', ?, 'new', ?, ?)",
+                         (vk_id, info['name'], info['avatar'], f"https://vk.com/id{vk_id}", 'new', info['can_message'], project_id), commit=True)
+            rec_id = cur 
+            if not isinstance(rec_id, int):
+                # Fallback to fetch if cursor didn't return ID
+                fresh = execute_query("SELECT id FROM recipients WHERE vk_user_id=? AND project_id=?", (vk_id, project_id), fetch_one=True)
+                rec_id = fresh['id']
+
+        return jsonify({'status': 'added', 'id': rec_id})
+
+    # GET: Strict Filter
+    rows = execute_query("SELECT * FROM recipients WHERE project_id=? ORDER BY id DESC", (project_id,), fetch_all=True)
+    results = []
+    for r in rows:
+        d = dict(r)
+        if d.get('tags'):
+            d['tags'] = d['tags'].split(',')
+        else:
+            d['tags'] = []
+        results.append(d)
+    return jsonify(results)
+
+@app.route('/api/recipients/search-ids', methods=['POST'])
+def search_recipient_ids():
+    """
+    KAIZEN: Optimized search.
+    Returns:
+    1. 'ids': ALL matching IDs (for import)
+    2. 'preview': Top 50 full objects (for UI visualization)
+    """
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    try:
+        d = request.json
+        statuses = d.get('statuses', []) 
+        tags = d.get('tags', [])       
+        search = d.get('search', '').lower().strip()
+        
+        # Strict project filter
+        query_parts = ["SELECT * FROM recipients WHERE project_id=?"]
+        params = [project_id]
+        
+        # Filter by Status
+        if statuses:
+            placeholders = ','.join('?' * len(statuses))
+            query_parts.append(f"AND crm_status IN ({placeholders})")
+            params.extend(statuses)
+            
+        # Filter by Search (Name or ID)
+        if search:
+            query_parts.append("AND (LOWER(name) LIKE ? OR vk_user_id LIKE ? OR LOWER(notes) LIKE ?)")
+            term = f"%{search}%"
+            params.extend([term, term, term])
+            
+        # Filter by Tags
+        if tags:
+            tag_conditions = []
+            for tag in tags:
+                tag_conditions.append("tags LIKE ?")
+                params.append(f"%{tag}%")
+            
+            if tag_conditions:
+                query_parts.append(f"AND ({' OR '.join(tag_conditions)})")
+
+        final_query = " ".join(query_parts)
+        rows = execute_query(final_query, tuple(params), fetch_all=True)
+        
+        # 1. All IDs for bulk action
+        all_ids = [r['vk_user_id'] for r in rows]
+        
+        # 2. Preview Data (Max 50 to save bandwidth)
+        preview_rows = rows[:50]
+        preview_data = []
+        for r in preview_rows:
+            item = dict(r)
+            if item.get('tags'):
+                item['tags'] = item['tags'].split(',')
+            else:
+                item['tags'] = []
+            preview_data.append(item)
+        
+        return jsonify({
+            'count': len(all_ids),
+            'ids': all_ids,
+            'preview': preview_data
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/recipients/<int:id>/status', methods=['PUT'])
+def update_recipient_status(id):
+    new_status = request.json.get('status')
+    if new_status not in CRM_STATUSES:
+        return jsonify({'error': 'Invalid status'}), 400
+        
+    execute_query("UPDATE recipients SET crm_status=? WHERE id=?", (new_status, id), commit=True)
+    return jsonify({'status': 'updated', 'new_status': new_status})
+
+@app.route('/api/recipients/<int:id>/notes', methods=['PUT'])
+def update_recipient_notes(id):
+    notes = request.json.get('notes', '')
+    execute_query("UPDATE recipients SET notes=? WHERE id=?", (notes, id), commit=True)
+    return jsonify({'status': 'updated', 'notes': notes})
+
+@app.route('/api/recipients/<int:id>/tags', methods=['PUT'])
+def update_recipient_tags(id):
+    tags = request.json.get('tags', []) 
+    tags_str = ",".join(tags)
+    execute_query("UPDATE recipients SET tags=? WHERE id=?", (tags_str, id), commit=True)
+    return jsonify({'status': 'updated', 'tags': tags})
+
+@app.route('/api/recipients/<int:id>/refresh', methods=['POST'])
+def refresh_recipient(id):
+    rec = execute_query("SELECT vk_user_id, project_id FROM recipients WHERE id=?", (id,), fetch_one=True)
+    if not rec: return jsonify({'error': 'Not found'}), 404
+    
+    # Use project context from the recipient itself
+    project_id = rec['project_id']
+    
+    acc = execute_query("SELECT access_token FROM accounts WHERE status='OK' AND project_id=? LIMIT 1", (project_id,), fetch_one=True)
+    if not acc: return jsonify({'error': 'No accounts'}), 400
+    
+    info = fetch_info_universal(acc['access_token'], rec['vk_user_id'])
+    if info:
+        execute_query("UPDATE recipients SET name=?, avatar=?, can_message=? WHERE id=?", 
+                     (info['name'], info['avatar'], info['can_message'], id), commit=True)
+    return jsonify({'status': 'updated'})
+
+@app.route('/api/recipients/<int:id>', methods=['DELETE'])
+def delete_recipient(id):
+    try:
+        count = execute_query("DELETE FROM recipients WHERE id=?", (id,), commit=True)
+        if count == 0: 
+            return jsonify({'error': 'Delete failed or not found'}), 404
+        return jsonify({'status': 'deleted'})
+    except Exception as e:
+        return jsonify({'error': f"DB Error: {str(e)}"}), 500
+
+@app.route('/api/export-recipients', methods=['GET'])
+def export_recipients():
+    try:
+        project_id = request.headers.get('X-Project-Id', 1)
+        fmt = request.args.get('format', 'csv')
+        # Strict Project Filter
+        rows = execute_query("SELECT * FROM recipients WHERE project_id=? ORDER BY id ASC", (project_id,), fetch_all=True)
+        
+        data_list = []
+        for r in rows:
+            data_list.append({
+                'ID': r['id'],
+                'Name': r['name'],
+                'VK_ID': r['vk_user_id'],
+                'Profile_URL': r['profile_url'],
+                'Campaign': r['campaign_name'],
+                'Status': r['status'],
+                'CRM_Status': CRM_STATUSES.get(r['crm_status'], r['crm_status']),
+                'Notes': r['notes'] or '',
+                'Tags': r['tags'] or ''
+            })
+
+        if fmt == 'json':
+            output = make_response(json.dumps(data_list, ensure_ascii=False, indent=2))
+            output.headers["Content-Disposition"] = "attachment; filename=recipients_export.json"
+            output.headers["Content-type"] = "application/json"
+            return output
+        else:
+            si = io.StringIO()
+            si.write('\ufeff') 
+            cw = csv.DictWriter(si, fieldnames=data_list[0].keys(), delimiter=';')
+            cw.writeheader()
+            cw.writerows(data_list)
+            
+            output = make_response(si.getvalue())
+            output.headers["Content-Disposition"] = "attachment; filename=recipients_export.csv"
+            output.headers["Content-type"] = "text/csv; charset=utf-8-sig"
+            return output
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

@@ -1,0 +1,149 @@
+
+from flask import request, jsonify
+import re
+from backend_core import app, execute_query, log_system, generate_random_user_agent
+from backend_tools import vk_api_call
+
+# =========================
+# ACCOUNTS IMPORT LOGIC
+# =========================
+
+def smart_parse_text(text):
+    """
+    Heuristic parser for account data.
+    Supported Delimiters: : ; |
+    Supported Fields: Token, Login (Phone/Email), Password, ID
+    """
+    results = []
+    lines = text.strip().split('\n')
+    
+    for line in lines:
+        if not line.strip(): continue
+        
+        # Split by common separators
+        parts = re.split(r'[:;|]', line.strip())
+        parts = [p.strip() for p in parts if p.strip()]
+        
+        acc_data = {
+            "token": None,
+            "login": None,
+            "password": None,
+            "vk_id": None
+        }
+        
+        # Heuristic Analysis
+        for part in parts:
+            # 1. TOKEN: > 60 chars OR contains vk1.a.
+            if len(part) > 60 or "vk1.a." in part:
+                acc_data["token"] = part
+                continue
+                
+            # 2. LOGIN (Email or Phone)
+            # Email
+            if '@' in part and '.' in part:
+                acc_data["login"] = part
+                continue
+            # Phone (10-15 digits, optional +)
+            if re.match(r'^\+?\d{10,15}$', part):
+                acc_data["login"] = part
+                continue
+                
+            # 3. ID (Digits < 15 chars, usually specific if present)
+            if part.isdigit() and len(part) < 15 and not acc_data["vk_id"]:
+                # Ambiguity check: could be password if numeric?
+                # Usually ID comes before token in shops.
+                acc_data["vk_id"] = part
+                continue
+                
+            # 4. Fallback -> Password
+            if not acc_data["password"]:
+                acc_data["password"] = part
+                
+        # Post-processing: If we found token but no login, maybe password field is actually login?
+        
+        if acc_data["token"]:
+            results.append(acc_data)
+            
+    return results
+
+@app.route('/api/accounts/parse', methods=['POST'])
+def parse_accounts():
+    try:
+        raw_text = request.json.get('text', '')
+        if not raw_text:
+            return jsonify({'error': 'Empty text'}), 400
+            
+        parsed = smart_parse_text(raw_text)
+        return jsonify({'count': len(parsed), 'parsed': parsed})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts/batch', methods=['POST'])
+def batch_save_accounts():
+    try:
+        project_id = request.headers.get('X-Project-Id', 1)
+        accounts_list = request.json.get('accounts', [])
+        group_name = request.json.get('group_name', 'Imported')
+        
+        if not accounts_list:
+            return jsonify({'error': 'No accounts provided'}), 400
+            
+        saved_count = 0
+        
+        for acc in accounts_list:
+            token = acc.get('token')
+            if not token: continue
+            
+            # Generate UA immediately
+            ua = generate_random_user_agent()
+            
+            # Initial API Check to get Name/ID/Avatar
+            # We use the generated UA for this check
+            res = vk_api_call('users.get', {'fields': 'photo_200'}, token, user_agent=ua)
+            
+            vk_id = acc.get('vk_id')
+            name = f"User {vk_id}" if vk_id else "Unknown"
+            avatar = ""
+            status = "OK"
+            error_details = None
+            
+            if 'response' in res:
+                u = res['response'][0]
+                vk_id = str(u['id'])
+                name = f"{u['first_name']} {u['last_name']}"
+                avatar = u.get('photo_200', '')
+                if 'deactivated' in u:
+                    status = 'BANNED'
+                    error_details = f"Account {u['deactivated']}"
+            elif 'error' in res:
+                status = "INVALID"
+                error_details = res['error'].get('error_msg', 'Unknown Error')
+                if not vk_id: vk_id = "0" # Temp ID to allow saving invalid tokens for review
+            
+            # Upsert Logic
+            exist = execute_query("SELECT id FROM accounts WHERE vk_user_id=? AND project_id=?", (vk_id, project_id), fetch_one=True)
+            
+            login = acc.get('login', '')
+            password = acc.get('password', '')
+            
+            if exist:
+                execute_query("""
+                    UPDATE accounts 
+                    SET access_token=?, name=?, avatar=?, status=?, error_details=?, 
+                        group_name=?, user_agent=?, login=?, password=? 
+                    WHERE id=?
+                """, (token, name, avatar, status, error_details, group_name, ua, login, password, exist['id']), commit=True)
+            else:
+                execute_query("""
+                    INSERT INTO accounts 
+                    (vk_user_id, name, avatar, access_token, status, error_details, group_name, project_id, user_agent, login, password) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (vk_id, name, avatar, token, status, error_details, group_name, project_id, ua, login, password), commit=True)
+            
+            saved_count += 1
+            
+        log_system("INFO", f"Batch import complete. Saved {saved_count} accounts to Project {project_id}.")
+        return jsonify({'status': 'ok', 'saved': saved_count})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

@@ -1,0 +1,206 @@
+
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+from backend_core import log_system, execute_query, STOP_FLAGS, ACTIVE_CAMPAIGNS
+from backend_worker_common import check_campaign_window
+from backend_worker_templates import prepare_templates_pool
+from backend_worker_step import process_account_step
+import random
+
+def generate_completion_report(campaign_name):
+    """Generates and logs a detailed report when campaign finishes."""
+    try:
+        # Stats
+        total = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=?", (campaign_name,), fetch_one=True)['c']
+        sent = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND (status='sent' OR status='chat' OR crm_status='progress')", (campaign_name,), fetch_one=True)['c']
+        errors = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND status LIKE 'Error%'", (campaign_name,), fetch_one=True)['c']
+        skipped = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND (status='skipped' OR status='blocked' OR status='blacklist')", (campaign_name,), fetch_one=True)['c']
+        
+        report_msg = f"$REPORT: Рассылка '{campaign_name}' завершена.\n\n"
+        report_msg += f"Всего: {total}\n"
+        report_msg += f"✅ Отправлено: {sent}\n"
+        report_msg += f"❌ Ошибки: {errors}\n"
+        report_msg += f"⏭ Пропущено: {skipped}"
+        
+        log_system("INFO", report_msg)
+    except Exception as e:
+        log_system("ERROR", f"Failed to generate report: {e}")
+
+# ==========================================
+# MODULE 2: LIFECYCLE WORKER (Parallel Core)
+# ==========================================
+def account_lifecycle_worker(account_id, campaign_name, templates_pool, constructor_options, attachments):
+    log_system("INFO", f"🧵 Thread started for Acc {account_id}")
+    
+    while True:
+        if STOP_FLAGS.get(campaign_name): break
+        settings = ACTIVE_CAMPAIGNS.get(campaign_name)
+        if not settings: break
+            
+        # KAIZEN: Optimized RAM check
+        if not check_campaign_window(campaign_name):
+            time.sleep(60)
+            continue
+
+        status, sleep_time = process_account_step(account_id, campaign_name, templates_pool, constructor_options, attachments)
+        
+        if status == 'stop': break
+        elif status == 'no_work': time.sleep(sleep_time)
+        elif status == 'error': time.sleep(sleep_time)
+        else:
+            log_system("INFO", f"[Acc {account_id}] Sleeping {sleep_time:.1f}s...")
+            steps = int(sleep_time)
+            for _ in range(steps):
+                if STOP_FLAGS.get(campaign_name): break
+                time.sleep(1)
+            if not STOP_FLAGS.get(campaign_name):
+                time.sleep(sleep_time - steps)
+
+    log_system("INFO", f"🏁 Thread finished for Acc {account_id}")
+
+# ==========================================
+# MODULE 3: ORCHESTRATOR
+# ==========================================
+
+def run_campaign_manager(campaign_name, specific_template_ids=None, custom_text=None, message_mode='template', source_campaign_name=None, constructor_options=None, attachments=None, source_subtype=None, start_at=None):
+    """
+    Главный менеджер кампании. 
+    """
+    log_system("INFO", f"🚀 MANAGER STARTED: {campaign_name}")
+    
+    # 0. Delayed Start
+    if start_at:
+        now_ts = time.time()
+        if start_at > now_ts:
+            wait_sec = start_at - now_ts
+            log_system("INFO", f"⏳ Scheduled wait: {int(wait_sec)}s")
+            while time.time() < start_at:
+                if STOP_FLAGS.get(campaign_name): return
+                time.sleep(1)
+
+    STOP_FLAGS[campaign_name] = False
+    
+    try:
+        # 1. Prepare Templates
+        pool = prepare_templates_pool(message_mode, specific_template_ids, custom_text, source_campaign_name, constructor_options, source_subtype, attachments)
+        if not pool and not attachments:
+            log_system("ERROR", "No templates generated. Aborting.")
+            return
+
+        # 2. Setup
+        settings = ACTIVE_CAMPAIGNS.get(campaign_name)
+        mode = settings.get('execution_mode', 'sequential')
+        
+        acc_ids = settings.get('accounts', [])
+        if acc_ids:
+            placeholders = ','.join('?' * len(acc_ids))
+            active_accounts = execute_query(f"SELECT id FROM accounts WHERE status='OK' AND id IN ({placeholders})", tuple(acc_ids), fetch_all=True)
+        else:
+            active_accounts = execute_query("SELECT id FROM accounts WHERE status='OK'", fetch_all=True)
+        
+        active_ids = [a['id'] for a in active_accounts]
+        
+        if not active_ids:
+            log_system("ERROR", "No active accounts to start.")
+            return
+
+        # ==========================
+        # MODE: PARALLEL (THREADS)
+        # ==========================
+        if mode == 'parallel':
+            log_system("WARNING", f"🔥 STARTING PARALLEL MODE ({len(active_ids)} threads).")
+            with ThreadPoolExecutor(max_workers=len(active_ids)) as executor:
+                futures = []
+                for acc_id in active_ids:
+                    f = executor.submit(account_lifecycle_worker, acc_id, campaign_name, pool, constructor_options, attachments)
+                    futures.append(f)
+                
+                while not STOP_FLAGS.get(campaign_name):
+                    time.sleep(5)
+                    left = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND (status='queued' OR status='reserved')", (campaign_name,), fetch_one=True)['c']
+                    if left == 0:
+                        generate_completion_report(campaign_name)
+                        STOP_FLAGS[campaign_name] = True
+                        break
+                wait(futures)
+
+        # ==========================
+        # MODE: SEQUENTIAL (LOOP) with SILENT SWITCHING
+        # ==========================
+        else:
+            log_system("INFO", "🔄 STARTING SEQUENTIAL MODE")
+            
+            while not STOP_FLAGS.get(campaign_name):
+                settings = ACTIVE_CAMPAIGNS.get(campaign_name)
+                if not settings: break
+                
+                if not check_campaign_window(campaign_name):
+                    log_system("INFO", "💤 Night mode. Sleeping 60s...")
+                    time.sleep(60)
+                    continue
+
+                # Refresh accounts list
+                acc_ids = settings.get('accounts', [])
+                if acc_ids:
+                    placeholders = ','.join('?' * len(acc_ids))
+                    current_accounts = execute_query(f"SELECT id FROM accounts WHERE status='OK' AND id IN ({placeholders})", tuple(acc_ids), fetch_all=True)
+                else:
+                    current_accounts = execute_query("SELECT id FROM accounts WHERE status='OK'", fetch_all=True)
+                
+                current_active_ids = [a['id'] for a in current_accounts]
+                
+                left = execute_query("SELECT COUNT(*) as c FROM recipients WHERE campaign_name=? AND (status='queued' OR status='reserved')", (campaign_name,), fetch_one=True)['c']
+                if left == 0:
+                    generate_completion_report(campaign_name)
+                    break
+
+                any_work_done = False
+                
+                # Iterate through accounts one by one
+                for acc_id in current_active_ids:
+                    if STOP_FLAGS.get(campaign_name): break
+                    
+                    status, sleep_val = process_account_step(acc_id, campaign_name, pool, constructor_options, attachments)
+                    
+                    if status == 'work_done':
+                        any_work_done = True
+                        log_system("INFO", f"Sequential sleep: {sleep_val:.1f}s")
+                        
+                        # Standard Delay
+                        steps = int(sleep_val)
+                        for _ in range(steps):
+                            if STOP_FLAGS.get(campaign_name): break
+                            time.sleep(1)
+                        if not STOP_FLAGS.get(campaign_name):
+                            time.sleep(sleep_val - steps)
+                            
+                        # SILENT MODE: Account Switching Pause
+                        # Only pause if there is more work to do and we are switching accounts
+                        # (Ideally check if this was the last action for this account in this batch)
+                        # For safety, we just add a pause if we are moving to the next account? 
+                        # Actually, sequential usually means load balancing.
+                        # Let's add a "Human Pause" between account switches.
+                        
+                        if len(current_active_ids) > 1:
+                            human_pause = random.uniform(300, 600) # 5-10 minutes
+                            log_system("INFO", f"Silent Mode: Switching accounts... Pausing {int(human_pause/60)} min.")
+                            
+                            # Break pause into chunks to allow stop
+                            chunks = int(human_pause / 5)
+                            for _ in range(chunks):
+                                if STOP_FLAGS.get(campaign_name): break
+                                time.sleep(5)
+                
+                if not any_work_done:
+                    time.sleep(5)
+
+    except Exception as e:
+        log_system("CRITICAL", f"Manager crashed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Cleanup
+    STOP_FLAGS.pop(campaign_name, None)
+    ACTIVE_CAMPAIGNS.pop(campaign_name, None)
+    log_system("INFO", f"Campaign {campaign_name} stopped/finished.")

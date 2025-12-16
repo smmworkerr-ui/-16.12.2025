@@ -1,0 +1,267 @@
+
+from flask import request, jsonify
+import re
+import time
+from backend_core import app, execute_query, log_system, generate_random_user_agent
+from backend_tools import vk_api_call
+from backend_health import update_account_health
+
+# =========================
+# STANDARD ACCOUNTS CRUD
+# =========================
+
+@app.route('/api/check-token', methods=['POST'])
+def check_token():
+    try:
+        raw_token = request.json.get('token', '')
+        if not raw_token:
+            return jsonify({'error': 'Токен не может быть пустым'}), 400
+        
+        match = re.search(r'access_token=([^&]+)', raw_token)
+        token = match.group(1) if match else raw_token.strip()
+        
+        res = vk_api_call('users.get', {'fields': 'photo_200'}, token)
+        
+        if 'error' in res: 
+            error_code = res['error'].get('error_code')
+            error_msg = res['error'].get('error_msg')
+            if error_code == 5:
+                return jsonify({'valid': False, 'message': f"Токен невалиден (Ошибка 5)"})
+            return jsonify({'valid': False, 'message': f"Ошибка ВК: {error_msg}"})
+        
+        if 'response' in res:
+            u = res['response'][0]
+            if 'deactivated' in u:
+                reason = u['deactivated']
+                return jsonify({'valid': False, 'message': f"Аккаунт заблокирован или удален ({reason})"})
+
+            name = f"{u['first_name']} {u['last_name']}"
+            return jsonify({
+                'valid': True, 
+                'message': f"Токен валиден! Это аккаунт: {name} (ID: {u['id']})"
+            })
+            
+        return jsonify({'valid': False, 'message': 'Не удалось получить данные'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts/<int:id>/check', methods=['POST'])
+def check_account_token(id):
+    try:
+        acc = execute_query("SELECT * FROM accounts WHERE id=?", (id,), fetch_one=True)
+        if not acc:
+            return jsonify({'error': 'Account not found'}), 404
+            
+        token = acc['access_token']
+        # User-Agent needed here? Ideally yes, but for a check we can use the stored one or None.
+        
+        # 1. Identity Check (users.get)
+        res = vk_api_call('users.get', {'fields': 'photo_200'}, token)
+        
+        status = 'OK'
+        error_details = None
+        
+        if 'error' in res: 
+            error_code = res['error'].get('error_code')
+            error_msg = res['error'].get('error_msg')
+            
+            if error_code == 5:
+                status = 'INVALID' # Token expired/revoked
+                error_details = "Токен невалиден (Code 5)"
+            elif error_code == 18:
+                status = 'BANNED' # User deleted or banned
+                error_details = "Страница удалена (Code 18)"
+            elif error_code == 29:
+                status = 'ERROR'
+                error_details = "Лимит запросов (Code 29)"
+            else:
+                status = 'ERROR'
+                error_details = f"VK Error {error_code}: {error_msg}"
+                
+        elif 'response' in res:
+            u = res['response'][0]
+            name = f"{u['first_name']} {u['last_name']}"
+            avatar = u.get('photo_200')
+            
+            if 'deactivated' in u:
+                reason = u['deactivated']
+                status = 'BANNED'
+                error_details = f"Аккаунт {reason}"
+            else:
+                # 2. DEEP CHECK: Permissions Check (messages.getConversations)
+                # This catches bans where login is allowed but messaging is forbidden
+                msg_res = vk_api_call('messages.getConversations', {'count': 1}, token)
+                
+                if 'error' in msg_res:
+                    error_code = msg_res['error'].get('error_code')
+                    error_msg = msg_res['error'].get('error_msg')
+                    
+                    if error_code == 5:
+                        status = 'INVALID'
+                        error_details = "Токен устарел (Auth Failed)"
+                    elif error_code in [7, 15, 900, 901, 902]:
+                        status = 'BANNED'
+                        error_details = "Нет прав на сообщения (Ban)"
+                    else:
+                        status = 'ERROR'
+                        error_details = f"Msg Error {error_code}: {error_msg}"
+                else:
+                    status = 'OK'
+                    error_details = None
+
+            # Update DB
+            if status == 'OK':
+                execute_query("UPDATE accounts SET name=?, avatar=?, status='OK', error_details=NULL WHERE id=?", 
+                              (name, avatar, id), commit=True)
+            else:
+                execute_query("UPDATE accounts SET name=?, avatar=?, status=?, error_details=? WHERE id=?", 
+                              (name, avatar, status, error_details, id), commit=True)
+        else:
+             status = 'ERROR'
+             error_details = 'Unknown response from VK'
+             execute_query("UPDATE accounts SET status=?, error_details=? WHERE id=?", (status, error_details, id), commit=True)
+        
+        return jsonify({
+            'valid': status == 'OK', 
+            'message': error_details or 'Аккаунт полностью функционален'
+        })
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts', methods=['GET', 'POST'])
+def api_accounts():
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    if request.method == 'POST':
+        try:
+            raw_token = request.json.get('token', '')
+            group_name = request.json.get('group_name', '') 
+            
+            if not raw_token:
+                return jsonify({'error': 'Токен не может быть пустым'}), 400
+            
+            match = re.search(r'access_token=([^&]+)', raw_token)
+            token = match.group(1) if match else raw_token.strip()
+            
+            log_system("INFO", f"Adding account to Project {project_id}. Token len: {len(token)}")
+            
+            # Use a random UA for the initial check to trigger safety protocols immediately
+            ua = generate_random_user_agent()
+            res = vk_api_call('users.get', {'fields': 'photo_200'}, token, user_agent=ua)
+            
+            if 'error' in res: 
+                error_msg = res['error'].get('error_msg')
+                return jsonify({'error': f"VK Error: {error_msg}"}), 400
+            
+            u = res['response'][0]
+            vk_id, name = str(u['id']), f"{u['first_name']} {u['last_name']}"
+            
+            status = 'OK'
+            error_details = None
+            
+            # Check for ban on add
+            if 'deactivated' in u:
+                status = 'BANNED'
+                error_details = f"Account {u['deactivated']}"
+            
+            exist = execute_query("SELECT id FROM accounts WHERE vk_user_id=?", (vk_id,), fetch_one=True)
+            if exist:
+                # Update info AND assign new User-Agent just in case
+                execute_query("UPDATE accounts SET access_token=?, name=?, avatar=?, status=?, error_details=?, group_name=?, project_id=?, user_agent=? WHERE id=?", 
+                            (token, name, u.get('photo_200'), status, error_details, group_name, project_id, ua, exist['id']), commit=True)
+            else:
+                execute_query("INSERT INTO accounts (vk_user_id, name, avatar, access_token, status, error_details, group_name, project_id, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (vk_id, name, u.get('photo_200'), token, status, error_details, group_name, project_id, ua), commit=True)
+                            
+            return jsonify({'message': 'Saved'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    # Reset logic
+    current_ts = int(time.time())
+    one_day_sec = 86400
+    
+    all_accounts = execute_query("SELECT id, last_activity_at, messages_sent_today FROM accounts WHERE project_id=?", (project_id,), fetch_all=True)
+    
+    for acc in all_accounts:
+        update_account_health(acc['id'], 'check')
+
+        last_act = acc['last_activity_at']
+        if last_act:
+            try:
+                last_ts = int(last_act)
+                if (current_ts - last_ts) > one_day_sec:
+                    if acc['messages_sent_today'] > 0:
+                        execute_query("UPDATE accounts SET messages_sent_today=0, recipients_history_today='' WHERE id=?", (acc['id'],), commit=True)
+            except:
+                pass
+
+    rows = execute_query("SELECT * FROM accounts WHERE project_id=?", (project_id,), fetch_all=True)
+    results = []
+    for r in rows:
+        d = dict(r)
+        if d.get('tags'):
+            d['tags'] = d['tags'].split(',')
+        else:
+            d['tags'] = []
+        results.append(d)
+    return jsonify(results)
+
+@app.route('/api/accounts/<int:id>', methods=['DELETE', 'PUT'])
+def mod_account(id):
+    if request.method == 'DELETE': 
+        log_system("INFO", f"Deleting account ID: {id}")
+        count = execute_query("DELETE FROM accounts WHERE id=?", (id,), commit=True)
+        if count == 0:
+            return jsonify({'error': 'Account not found or delete failed'}), 404
+        return jsonify({'message': 'Deleted', 'count': count})
+
+    if request.method == 'PUT': 
+        d = request.json
+        raw_token = d.get('token')
+        group_name = d.get('group_name')
+        tags = d.get('tags')
+        
+        cleanup_days = d.get('cleanup_days')
+        cleanup_enabled = d.get('cleanup_enabled')
+        auto_accept_enabled = d.get('auto_accept_enabled')
+        auto_accept_msg = d.get('auto_accept_msg')
+        auto_accept_delay_min = d.get('auto_accept_delay_min')
+        auto_accept_delay_max = d.get('auto_accept_delay_max')
+        skip_dialog_exists = d.get('skip_dialog_exists')
+        auto_accept_skip_msg = d.get('auto_accept_skip_msg')
+        day_limit = d.get('day_limit')
+
+        if raw_token:
+            match = re.search(r'access_token=([^&]+)', raw_token)
+            token = match.group(1) if match else raw_token.strip()
+            # Reset status to OK if new token provided
+            execute_query("UPDATE accounts SET access_token=?, status='OK', error_details=NULL WHERE id=?", (token, id), commit=True)
+        
+        if group_name is not None:
+            execute_query("UPDATE accounts SET group_name=? WHERE id=?", (group_name, id), commit=True)
+            
+        updates = []
+        params = []
+        
+        if tags is not None:
+            tags_str = ",".join(tags)
+            updates.append("tags=?")
+            params.append(tags_str)
+        
+        if cleanup_days is not None: updates.append("cleanup_days=?"); params.append(cleanup_days)
+        if cleanup_enabled is not None: updates.append("cleanup_enabled=?"); params.append(int(cleanup_enabled))
+        if auto_accept_enabled is not None: updates.append("auto_accept_enabled=?"); params.append(int(auto_accept_enabled))
+        if auto_accept_msg is not None: updates.append("auto_accept_msg=?"); params.append(auto_accept_msg)
+        if auto_accept_delay_min is not None: updates.append("auto_accept_delay_min=?"); params.append(auto_accept_delay_min)
+        if auto_accept_delay_max is not None: updates.append("auto_accept_delay_max=?"); params.append(auto_accept_delay_max)
+        if skip_dialog_exists is not None: updates.append("skip_dialog_exists=?"); params.append(int(skip_dialog_exists))
+        if auto_accept_skip_msg is not None: updates.append("auto_accept_skip_msg=?"); params.append(int(auto_accept_skip_msg))
+        if day_limit is not None: updates.append("day_limit=?"); params.append(int(day_limit))
+        
+        if updates:
+            params.append(id)
+            execute_query(f"UPDATE accounts SET {', '.join(updates)} WHERE id=?", tuple(params), commit=True)
+            
+        return jsonify({'message': 'OK'})

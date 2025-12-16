@@ -1,0 +1,128 @@
+
+import time
+import random
+import threading
+from datetime import datetime
+from backend_core import log_system, execute_query, ACTIVE_CAMPAIGNS, CAMPAIGN_TIME_FLAGS
+from backend_tools import get_friend_requests, accept_friend_request, check_history_exists, fetch_info_universal, process_spintax
+from backend_worker_common import send_message_core, update_conversation_db, check_time_window
+
+def time_supervisor():
+    """
+    KAIZEN: Central Traffic Control Tower.
+    Проверяет время для всех кампаний 1 раз в 30 секунд.
+    Воркеры читают результат из RAM (CAMPAIGN_TIME_FLAGS), не нагружая CPU.
+    """
+    log_system("INFO", "$⏱️ TIME SUPERVISOR STARTED")
+    while True:
+        try:
+            # Копируем ключи, чтобы избежать ошибки изменения словаря во время итерации
+            campaign_names = list(ACTIVE_CAMPAIGNS.keys())
+            
+            for name in campaign_names:
+                settings = ACTIVE_CAMPAIGNS.get(name)
+                if not settings: continue
+                
+                # Используем существующую логику проверки
+                start = settings.get('work_start')
+                end = settings.get('work_end')
+                
+                is_allowed = check_time_window(start, end)
+                
+                # Обновляем глобальный флаг
+                # Если статус изменился, можно логировать
+                if CAMPAIGN_TIME_FLAGS.get(name) != is_allowed:
+                    status_str = "🟢 OPEN" if is_allowed else "🔴 CLOSED"
+                    log_system("INFO", f"Time Window for '{name}': {status_str}")
+                
+                CAMPAIGN_TIME_FLAGS[name] = is_allowed
+                
+            time.sleep(10) # Проверка каждые 10 секунд (достаточно точно)
+        except Exception as e:
+            print(f"Time supervisor error: {e}")
+            time.sleep(30)
+
+def maintenance_worker():
+    """
+    Фоновая задача обслуживания (Auto-Secretary).
+    Периодически проверяет аккаунты с включенным auto_accept.
+    """
+    
+    # Запускаем Time Supervisor в отдельном потоке внутри этого процесса
+    threading.Thread(target=time_supervisor, daemon=True).start()
+    
+    log_system("INFO", "$🛠️ MAINTENANCE WORKER STARTED")
+    
+    while True:
+        try:
+            # 1. Get Accounts with Auto-Accept Enabled
+            accounts_rows = execute_query("SELECT * FROM accounts WHERE status='OK' AND auto_accept_enabled=1", fetch_all=True)
+            
+            if not accounts_rows:
+                time.sleep(300) # Sleep 5 min if no accounts configured
+                continue
+                
+            for row in accounts_rows:
+                time.sleep(2) # Small pause between accounts to avoid burst
+                
+                # FIX: Convert sqlite3.Row to dict to support .get() method
+                acc = dict(row)
+                
+                token = acc['access_token']
+                
+                # Get incoming requests
+                requests_list = get_friend_requests(token, out=False, count=1)
+                
+                if requests_list:
+                    user_id = requests_list[0]
+                    log_system("INFO", f"🤖 Auto-Secretary ({acc['name']}): Processing {user_id}...")
+                    
+                    should_send_msg = True
+                    
+                    # Check if skip message is enabled (safe .get call now works)
+                    if acc.get('auto_accept_skip_msg', 1):
+                        log_system("INFO", f"Skip message to {user_id} (Configured to not send).")
+                        should_send_msg = False
+                    
+                    # Check existing dialog logic
+                    elif acc.get('skip_dialog_exists', 1) and check_history_exists(token, user_id):
+                        log_system("INFO", f"Skip message to {user_id} (Dialog Exists).")
+                        should_send_msg = False
+
+                    # Accept
+                    res_add = accept_friend_request(token, user_id)
+                    if 'error' in res_add:
+                        log_system("WARNING", f"Auto-accept failed for {user_id}: {res_add['error']['error_msg']}")
+                        continue
+                        
+                    # Send Message
+                    msg_text = acc.get('auto_accept_msg', '')
+                    if should_send_msg and msg_text and msg_text.strip():
+                        text_to_send = process_spintax(msg_text)
+                        
+                        u_info = fetch_info_universal(token, user_id)
+                        r_name = u_info['name'] if u_info else f"User {user_id}"
+                        r_avatar = u_info['avatar'] if u_info else ""
+                        
+                        short_name = r_name.split()[0]
+                        text_to_send = text_to_send.replace('{имя}', short_name)
+                        
+                        # Pass is_friend_declared=True since we just accepted them
+                        result_data, success = send_message_core(acc, user_id, text_to_send, None, is_friend_declared=True)
+                        
+                        if success:
+                             msg_id = result_data
+                             update_conversation_db(acc, user_id, {'name': r_name, 'avatar': r_avatar}, text_to_send, None, 'Auto-Secretary', msg_id=msg_id)
+                             log_system("INFO", f"✅ Auto-Secretary: Accepted & Sent to {user_id} ({acc['name']})")
+                        else:
+                             log_system("WARNING", f"Auto-Secretary: Accepted but msg failed: {result_data}")
+                    else:
+                        log_system("INFO", f"✅ Auto-Secretary: Accepted {user_id} (Silent)")
+            
+            # KAIZEN: Increased sleep time to 10-20 minutes to reduce API load and look human
+            global_wait = random.uniform(600, 1200) 
+            time.sleep(global_wait)
+            
+        except Exception as e:
+            log_system("ERROR", f"Maintenance worker crashed: {e}")
+            time.sleep(60)

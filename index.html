@@ -1,0 +1,117 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VK Messenger AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              // Standard Colors (Absolute)
+              white: '#ffffff',
+              black: '#000000',
+              
+              'vk-blue': 'var(--color-accent)',
+              'vk-blue-dark': 'var(--color-accent-dark)',
+              
+              // Semantic Theme Colors
+              'main': 'var(--color-bg-main)',       // App Background
+              'panel': 'var(--color-bg-panel)',     // Panels/Cards
+              'subpanel': 'var(--color-bg-subpanel)', // Nested lists
+              'hover': 'var(--color-bg-hover)',     // Hover state
+              
+              // Semantic Text Colors
+              'text-main': 'var(--color-text-main)', // Primary text (adaptive)
+              'text-muted': 'var(--color-text-muted)', // Secondary text
+              
+              // Borders
+              'border-main': 'var(--color-border)', 
+              
+              // Compatibility mappings (gradual migration)
+              'gray-900': 'var(--color-bg-main)',
+              'gray-800': 'var(--color-bg-panel)',
+              'gray-750': 'var(--color-bg-hover)',
+              'gray-700': 'var(--color-border)',
+            },
+            fontFamily: {
+              sans: ['ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', "Segoe UI", 'Roboto', "Helvetica Neue", 'Arial', 'sans-serif'],
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+        :root {
+            /* DEFAULT DARK THEME (Fallback) */
+            --color-bg-main: #111827;
+            --color-bg-panel: #1f2937;
+            --color-bg-subpanel: #374151;
+            --color-bg-hover: #374151;
+            --color-border: #4b5563;
+            --color-text-main: #f9fafb;
+            --color-text-muted: #9ca3af;
+            --color-accent: #3b82f6;
+            --color-accent-dark: #2563eb;
+        }
+
+        /* Scrollbars */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.05);
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: var(--color-border);
+            border-radius: 3px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: var(--color-accent);
+        }
+        
+        /* Animations */
+        @keyframes fade-in {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .animate-fade-in {
+            animation: fade-in 0.2s ease-out;
+        }
+        
+        @keyframes fade-in-left {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .animate-fade-in-left {
+            animation: fade-in-left 0.2s ease-out;
+        }
+        
+        .cursor-wait { cursor: wait; }
+    </style>
+<script type="importmap">
+{
+  "imports": {
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.29.1",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react-dom/client": "https://aistudiocdn.com/react-dom@^19.2.0/client",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react-dom": "https://aistudiocdn.com/react-dom@^19.2.0",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2",
+    "vite": "https://esm.sh/vite@^7.3.0",
+    "path": "https://esm.sh/path@^0.12.7"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body class="bg-main text-text-main h-screen w-screen overflow-hidden">
+    <div id="root" class="h-full w-full"></div>
+    <script type="module" src="/index.tsx"></script>
+</body>
+</html>

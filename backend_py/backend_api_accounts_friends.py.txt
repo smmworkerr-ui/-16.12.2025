@@ -1,0 +1,99 @@
+
+from flask import request, jsonify
+import json
+from backend_core import app, execute_query, log_system
+from backend_tools import update_account_friends_cache, get_friend_requests, fetch_batch_details, accept_friend_request, delete_friend_request
+
+# =========================
+# FRIENDS & REQUESTS
+# =========================
+
+@app.route('/api/accounts/<int:id>/friends', methods=['GET'])
+def get_account_friends(id):
+    try:
+        row = execute_query("SELECT friends_cache_json FROM accounts WHERE id=?", (id,), fetch_one=True)
+        if not row:
+            return jsonify({'error': 'Account not found'}), 404
+            
+        json_str = row['friends_cache_json']
+        if not json_str:
+            return jsonify([])
+            
+        friends = json.loads(json_str)
+        return jsonify(friends)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts/<int:id>/friends/refresh', methods=['POST'])
+def refresh_account_friends(id):
+    try:
+        acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (id,), fetch_one=True)
+        if not acc:
+            return jsonify({'error': 'Account not found'}), 404
+            
+        count = update_account_friends_cache(id, acc['access_token'])
+        return jsonify({'status': 'ok', 'count': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts/<int:id>/requests', methods=['GET'])
+def get_incoming_requests(id):
+    try:
+        acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (id,), fetch_one=True)
+        if not acc: return jsonify({'error': 'Account not found'}), 404
+        
+        # Get IDs
+        ids = get_friend_requests(acc['access_token'], out=False, count=50)
+        if not ids: return jsonify([])
+        
+        # Get Profiles
+        profiles = fetch_batch_details(acc['access_token'], ids)
+        
+        result = []
+        for uid in ids:
+            p = profiles.get(uid)
+            if p:
+                result.append({'id': uid, 'name': p['name'], 'avatar': p['avatar']})
+                
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/accounts/<int:id>/requests/accept', methods=['POST'])
+def accept_request_endpoint(id):
+    user_id = request.json.get('user_id')
+    acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (id,), fetch_one=True)
+    if not acc: return jsonify({'error': 'Account not found'}), 404
+    
+    res = accept_friend_request(acc['access_token'], user_id)
+    if 'error' in res: return jsonify({'error': res['error'].get('error_msg')}), 400
+    
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/accounts/<int:id>/requests/delete', methods=['POST'])
+def delete_request_endpoint(id):
+    user_id = request.json.get('user_id')
+    acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (id,), fetch_one=True)
+    if not acc: return jsonify({'error': 'Account not found'}), 404
+    
+    res = delete_friend_request(acc['access_token'], user_id)
+    if 'error' in res: return jsonify({'error': res['error'].get('error_msg')}), 400
+    
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/accounts/<int:id>/toggle-kamikaze', methods=['POST'])
+def toggle_kamikaze(id):
+    try:
+        acc = execute_query("SELECT kamikaze_mode, name FROM accounts WHERE id=?", (id,), fetch_one=True)
+        if not acc:
+            return jsonify({'error': 'Account not found'}), 404
+            
+        new_val = 0 if acc['kamikaze_mode'] else 1
+        execute_query("UPDATE accounts SET kamikaze_mode=? WHERE id=?", (new_val, id), commit=True)
+        
+        status_text = "ENABLED 🔥" if new_val else "DISABLED"
+        log_system("WARNING" if new_val else "INFO", f"Kamikaze Mode {status_text} for {acc['name']}")
+        
+        return jsonify({'status': 'ok', 'kamikaze_mode': bool(new_val)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

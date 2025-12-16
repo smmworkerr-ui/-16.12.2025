@@ -1,0 +1,217 @@
+
+import time
+import random
+import requests
+from datetime import datetime
+from backend_core import log_system, execute_query, VK_API_VERSION, STOP_FLAGS, ACTIVE_CAMPAIGNS, CAMPAIGN_TIME_FLAGS
+from backend_health import update_account_health, get_adaptive_delay
+from backend_tools import check_is_friend
+
+def check_time_window(start_hour, end_hour):
+    """
+    Базовая утилита проверки времени. 
+    Используется Time Supervisor'ом.
+    """
+    if start_hour is None or end_hour is None:
+        return True 
+        
+    now_hour = datetime.now().hour
+    
+    if start_hour == end_hour:
+        return True
+        
+    if start_hour < end_hour:
+        return start_hour <= now_hour < end_hour
+    else:
+        return now_hour >= start_hour or now_hour < end_hour
+
+def check_campaign_window(campaign_name):
+    """
+    KAIZEN: Optimized check.
+    Читает значение из RAM (обновляется Supervisor'ом).
+    Если значения нет (старт), проверяет вручную.
+    """
+    # 1. Fast Path (RAM)
+    if campaign_name in CAMPAIGN_TIME_FLAGS:
+        return CAMPAIGN_TIME_FLAGS[campaign_name]
+    
+    # 2. Fallback (Cold Start)
+    settings = ACTIVE_CAMPAIGNS.get(campaign_name)
+    if not settings: return True # Should stop elsewhere
+    return check_time_window(settings.get('work_start'), settings.get('work_end'))
+
+def smart_sleep(campaign_name, health_score=100, is_kamikaze=False):
+    """
+    Умная пауза с учетом здоровья аккаунта и режима.
+    KAIZEN: Использует оптимизированную проверку времени.
+    """
+    settings = ACTIVE_CAMPAIGNS.get(campaign_name)
+    if not settings: return True 
+
+    delay_mode = settings.get('delay_mode', 'manual')
+    delay_min = settings.get('delay_min', 5)
+    delay_max = settings.get('delay_max', 15)
+
+    # 1. Check Window (Optimized)
+    while not check_campaign_window(campaign_name):
+        if STOP_FLAGS.get(campaign_name): return False
+        
+        # Если окно закрыто, спим минуту + джиттер
+        jitter = random.uniform(0, 5)
+        time.sleep(60 + jitter) 
+        
+        if campaign_name not in ACTIVE_CAMPAIGNS: return False
+
+    # 2. Delay Logic
+    delay = 0
+    
+    if is_kamikaze:
+        if delay_mode == 'manual':
+             delay = random.uniform(delay_min, delay_max)
+        else:
+             delay = random.uniform(2, 5)
+    elif delay_mode == 'manual':
+        delay = random.uniform(delay_min, delay_max)
+    else:
+        # Auto
+        delay = get_adaptive_delay(health_score, base_min=60, base_max=120)
+
+    steps = int(delay)
+    for _ in range(steps):
+        if STOP_FLAGS.get(campaign_name): return False
+        time.sleep(1)
+    
+    time.sleep(delay - steps)
+    return True
+
+def generate_text(pool, constructor_options, campaign_name=None):
+    if isinstance(pool, dict) and pool.get('type') == 'dynamic_constructor':
+        parts_to_assemble = []
+        data = pool['data']
+        req_parts = pool['requested_parts']
+        for subtype in req_parts:
+            options = data.get(subtype, [])
+            if options: parts_to_assemble.append(random.choice(options))
+        
+        separator = "\n\n" 
+        if constructor_options and constructor_options.get('no_newlines'): separator = " " 
+        return separator.join([p for p in parts_to_assemble if p.strip()])
+        
+    elif isinstance(pool, list):
+        if not pool: return ""
+        if campaign_name and campaign_name in ACTIVE_CAMPAIGNS:
+            config = ACTIVE_CAMPAIGNS[campaign_name]
+            if 'rotation_deck' not in config or not config['rotation_deck']:
+                indices = list(range(len(pool)))
+                random.shuffle(indices)
+                config['rotation_deck'] = indices
+            try:
+                idx = config['rotation_deck'].pop()
+                chosen = pool[idx]
+                return chosen['text']
+            except (IndexError, KeyError):
+                chosen = random.choice(pool)
+                return chosen['text']
+        else:
+            chosen = random.choice(pool)
+            return chosen['text']
+    return ""
+
+def send_message_core(acc, peer_id, text, attachments, is_friend_declared=False, skip_limit_count=False, user_agent=None):
+    """
+    Отправляет сообщение и возвращает (ResultID/Error, is_success).
+    KAIZEN: Атомарное обновление счетчиков.
+    SILENT MODE: Uses specific User-Agent.
+    """
+    params = {
+        'peer_id': peer_id,
+        'message': text,
+        'random_id': random.getrandbits(31),
+        'access_token': acc['access_token'],
+        'v': VK_API_VERSION
+    }
+    if attachments and len(attachments) > 0:
+        params['attachment'] = ",".join(attachments)
+
+    headers = {}
+    if user_agent:
+        headers['User-Agent'] = user_agent
+
+    try:
+        # 1. Check is Friend?
+        is_friend = False
+        if is_friend_declared:
+            is_friend = True
+        elif not skip_limit_count: 
+            try:
+                is_friend = check_is_friend(acc['access_token'], peer_id)
+            except: pass
+
+        resp = requests.post("https://api.vk.com/method/messages.send", data=params, headers=headers, timeout=20).json()
+        
+        if 'error' in resp:
+            error_data = resp['error']
+            code = error_data['error_code']
+            error_msg = error_data['error_msg']
+            
+            event = 'error'
+            if code == 14: event = 'captcha'
+            if code == 9: event = 'flood'
+            update_account_health(acc['id'], event)
+            
+            return f"Error: {error_msg} (Code {code})", False
+            
+        # Success
+        try:
+            should_count = True
+            
+            if skip_limit_count or is_friend:
+                should_count = False
+            else:
+                # Check uniqueness for today (Optimized fetch)
+                # Note: We fetch minimal data here
+                fresh_acc = execute_query("SELECT recipients_history_today FROM accounts WHERE id=?", (acc['id'],), fetch_one=True)
+                history = (fresh_acc['recipients_history_today'] or "").split(',')
+                if str(peer_id) in history:
+                    should_count = False
+            
+            if should_count:
+                update_account_health(acc['id'], 'sent')
+                
+                # Atomic Increment
+                fresh_acc = execute_query("SELECT recipients_history_today FROM accounts WHERE id=?", (acc['id'],), fetch_one=True)
+                current_history = fresh_acc['recipients_history_today'] or ""
+                new_history = f"{current_history},{peer_id}" if current_history else str(peer_id)
+                
+                execute_query(
+                    "UPDATE accounts SET messages_sent_today = messages_sent_today + 1, recipients_history_today = ? WHERE id = ?", 
+                    (new_history, acc['id']), 
+                    commit=True
+                )
+            
+        except Exception as e:
+            print(f"Stats update error: {e}")
+
+        return resp['response'], True
+    except Exception as e:
+        update_account_health(acc['id'], 'error')
+        return f"Error: Net {e}", False
+
+def update_conversation_db(acc, peer_id, recipient_info, text, attachments, campaign_name, msg_id=None):
+    conv_id = f"{acc['id']}_{peer_id}"
+    preview_text = text
+    if not preview_text and attachments: preview_text = "[Вложение]"
+    
+    old_conv = execute_query("SELECT campaign_name FROM conversations WHERE id=?", (conv_id,), fetch_one=True)
+    current_campaigns = [c.strip() for c in ((old_conv['campaign_name'] if old_conv else '') or '').split('|') if c.strip()]
+    if campaign_name not in current_campaigns:
+        current_campaigns.append(campaign_name)
+    
+    # Use REPLACE for speed
+    execute_query("""INSERT OR REPLACE INTO conversations (id, owner_id, peer_id, name, avatar, last_message, campaign_name, project_id) 
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", 
+                  (conv_id, str(acc['id']), str(peer_id), recipient_info['name'], recipient_info['avatar'], preview_text, ' | '.join(current_campaigns), acc.get('project_id', 1)), commit=True)
+    
+    real_id = msg_id if msg_id else int(time.time()*1000)
+    execute_query("INSERT OR IGNORE INTO messages (id, conversation_id, sender, text, date) VALUES (?, ?, 'me', ?, ?)",
+                 (real_id, conv_id, text, int(time.time())), commit=True)

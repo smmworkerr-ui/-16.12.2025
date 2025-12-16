@@ -1,0 +1,173 @@
+
+from flask import request, jsonify
+from datetime import datetime, timedelta
+from backend_core import app, execute_query
+from backend_tools import get_account_stats_vk
+
+# =========================
+# ANALYTICS
+# =========================
+
+@app.route('/api/analytics/vk-stats', methods=['GET'])
+def get_vk_realtime_stats():
+    """Fetches real-time stats from VK for all active accounts in current project."""
+    project_id = request.headers.get('X-Project-Id', 1)
+    try:
+        accounts = execute_query("SELECT id, name, avatar, access_token FROM accounts WHERE status='OK' AND project_id=?", (project_id,), fetch_all=True)
+        results = []
+        
+        for acc in accounts:
+            stats = get_account_stats_vk(acc['access_token'])
+            results.append({
+                'id': acc['id'],
+                'name': acc['name'],
+                'avatar': acc['avatar'],
+                'incoming': stats.get('incoming', 0),
+                'outgoing': stats.get('outgoing', 0),
+                'friends': stats.get('friends', 0)
+            })
+            
+        return jsonify(results)
+    except Exception as e:
+        print(f"[API ERROR] VK Stats failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/analytics', methods=['GET'])
+def get_analytics():
+    try:
+        project_id = request.headers.get('X-Project-Id', 1)
+        campaign_filter = request.args.get('campaign')
+        
+        # 1. Available Campaigns (Only for this project)
+        camp_rows = execute_query("SELECT DISTINCT campaign_name FROM recipients WHERE campaign_name IS NOT NULL AND campaign_name != '' AND project_id=?", (project_id,), fetch_all=True)
+        campaigns = sorted(list(set([r['campaign_name'] for r in camp_rows] + ['📥 Прямые сообщения'])))
+
+        # Filters Construction
+        rec_where = " WHERE project_id = ?"
+        rec_args = [project_id]
+        
+        # For Logs and Messages we need to be careful as they might not have direct project_id in old schema,
+        # but we migrated them. Messages link to Conversations which have project_id.
+        msg_join = " JOIN conversations c ON messages.conversation_id = c.id"
+        msg_where = " WHERE c.project_id = ?"
+        msg_args = [project_id]
+
+        if campaign_filter and campaign_filter != 'all':
+            if campaign_filter == '📥 Прямые сообщения':
+                rec_where += " AND (campaign_name IS NULL OR campaign_name = '' OR campaign_name = 'Manual' OR campaign_name = 'Ручное добавление')"
+                msg_where += " AND c.campaign_name LIKE ?"
+                msg_args.append('%Manual%')
+            else:
+                rec_where += " AND campaign_name = ?"
+                rec_args.append(campaign_filter)
+                msg_where += " AND c.campaign_name LIKE ?"
+                msg_args.append(f"%{campaign_filter}%")
+
+        # 2. Key Metrics
+        total_recipients = execute_query(f"SELECT COUNT(*) as c FROM recipients{rec_where}", tuple(rec_args), fetch_one=True)['c']
+        
+        # Success Rate
+        sent_count = execute_query(f"SELECT COUNT(*) as c FROM recipients{rec_where} AND (status='sent' OR status='chat')", tuple(rec_args), fetch_one=True)['c']
+
+        success_rate = 0
+        if total_recipients > 0:
+            success_rate = round((sent_count / total_recipients) * 100, 1)
+
+        # 3. CRM Distribution
+        crm_rows = execute_query(f"SELECT crm_status, COUNT(*) as c FROM recipients{rec_where} GROUP BY crm_status", tuple(rec_args), fetch_all=True)
+        crm_map = {r['crm_status'] or 'new': r['c'] for r in crm_rows}
+        crm_dist = [
+            {'name': 'new', 'value': crm_map.get('new', 0), 'fill': '#6b7280'},
+            {'name': 'progress', 'value': crm_map.get('progress', 0), 'fill': '#d97706'},
+            {'name': 'hot', 'value': crm_map.get('hot', 0), 'fill': '#3b82f6'},
+            {'name': 'success', 'value': crm_map.get('success', 0), 'fill': '#22c55e'},
+            {'name': 'reject', 'value': crm_map.get('reject', 0), 'fill': '#ef4444'},
+        ]
+
+        # 4. Error Breakdown
+        err_rows = execute_query(f"SELECT status, COUNT(*) as c FROM recipients{rec_where} AND (status LIKE 'Error%' OR status LIKE '%Privacy%' OR status LIKE '%Blacklist%') GROUP BY status", tuple(rec_args), fetch_all=True)
+        error_breakdown = []
+        for r in err_rows:
+            st = r['status']
+            name = "Error"
+            color = "#ef4444"
+            if "Privacy" in st: name = "Privacy (Закрыто)"; color="#f59e0b"
+            elif "Blacklist" in st: name = "Blacklist (ЧС)"; color="#000000"
+            elif "Code 901" in st: name = "No Permission"; color="#ef4444"
+            else: name = st.replace("Error: ", "").split('(')[0][:20]
+            
+            error_breakdown.append({'name': name, 'count': r['c'], 'color': color})
+        
+        # 5. Timeline (Last 7 days) - Uses JOIN
+        timeline = []
+        now = datetime.now()
+        for i in range(6, -1, -1):
+            day = now - timedelta(days=i)
+            ts_start = int(day.replace(hour=0, minute=0, second=0).timestamp())
+            ts_end = int(day.replace(hour=23, minute=59, second=59).timestamp())
+            date_str = day.strftime("%d.%m")
+            
+            # Outgoing (Sent)
+            # Need to join with conversations to filter by project
+            q_out = f"SELECT COUNT(*) as c FROM messages {msg_join} {msg_where} AND sender='me' AND date BETWEEN ? AND ?"
+            args_out = msg_args + [ts_start, ts_end]
+            sent = execute_query(q_out, tuple(args_out), fetch_one=True)['c']
+
+            # Incoming (Received)
+            q_in = f"SELECT COUNT(*) as c FROM messages {msg_join} {msg_where} AND sender='them' AND date BETWEEN ? AND ?"
+            args_in = msg_args + [ts_start, ts_end]
+            received = execute_query(q_in, tuple(args_in), fetch_one=True)['c']
+            
+            timeline.append({'date': date_str, 'sent': sent, 'received': received})
+
+        # 6. Heatmap - Uses JOIN
+        heatmap_query = f"""
+            SELECT 
+                CAST(strftime('%w', datetime(date, 'unixepoch')) as INTEGER) as day,
+                CAST(strftime('%H', datetime(date, 'unixepoch')) as INTEGER) as hour,
+                COUNT(*) as val
+            FROM messages 
+            {msg_join}
+            {msg_where} AND sender='them'
+            GROUP BY day, hour
+        """
+        hm_rows = execute_query(heatmap_query, tuple(msg_args), fetch_all=True)
+        heatmap_data = [{'day': r['day'], 'hour': r['hour'], 'value': r['val']} for r in hm_rows]
+
+        # 7. Account Health (Filtered by Project)
+        acc_rows = execute_query("SELECT id, name, avatar, status FROM accounts WHERE project_id=?", (project_id,), fetch_all=True)
+        account_health = []
+        for acc in acc_rows:
+            # Count conversations for this account in this project
+            c_count = execute_query("SELECT COUNT(*) as c FROM conversations WHERE owner_id=? AND project_id=?", (str(acc['id']), project_id), fetch_one=True)['c']
+            account_health.append({
+                'id': acc['id'],
+                'name': acc['name'],
+                'avatar': acc['avatar'],
+                'status': acc['status'],
+                'conversations_count': c_count,
+                'error_rate_proxy': 0
+            })
+
+        # 8. Top Campaigns (Filtered)
+        top_camp_rows = execute_query("SELECT campaign_name, COUNT(*) as c FROM recipients WHERE campaign_name IS NOT NULL AND campaign_name != '' AND project_id=? GROUP BY campaign_name ORDER BY c DESC LIMIT 5", (project_id,), fetch_all=True)
+        top_campaigns = [{'name': r['campaign_name'], 'count': r['c']} for r in top_camp_rows]
+
+        return jsonify({
+            'available_campaigns': campaigns,
+            'total_recipients': total_recipients,
+            'total_sent': sent_count,
+            'success_rate_percent': success_rate,
+            'crm_distribution': crm_dist,
+            'error_breakdown': error_breakdown,
+            'timeline_data': timeline,
+            'heatmap_data': heatmap_data,
+            'account_health': account_health,
+            'top_campaigns': top_campaigns,
+            'tech_distribution': [] 
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500

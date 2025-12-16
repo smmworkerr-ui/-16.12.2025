@@ -1,0 +1,231 @@
+
+from flask import request, jsonify
+import time
+import json
+from backend_core import app, execute_query, ACTIVE_CAMPAIGNS, STOP_FLAGS, log_system
+from backend_tools import vk_api_call, parse_full_message_text, serialize_attachments, upload_file_to_vk
+
+@app.route('/api/conversations', methods=['GET'])
+def get_conversations():
+    project_id = request.headers.get('X-Project-Id', 1)
+    # Filter conversations by project_id
+    rows = execute_query("SELECT * FROM conversations WHERE project_id=? ORDER BY pinned DESC, last_message DESC", (project_id,), fetch_all=True)
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/conversations/<id>/pin', methods=['POST'])
+def pin_conversation(id):
+    execute_query("UPDATE conversations SET pinned = CASE WHEN pinned=1 THEN 0 ELSE 1 END WHERE id=?", (id,), commit=True)
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/conversations/<id>', methods=['DELETE'])
+def delete_conversation(id):
+    execute_query("DELETE FROM conversations WHERE id=?", (id,), commit=True)
+    execute_query("DELETE FROM messages WHERE conversation_id=?", (id,), commit=True)
+    execute_query("DELETE FROM reminders WHERE conversation_id=?", (id,), commit=True)
+    return jsonify({'status': 'deleted'})
+
+@app.route('/api/campaigns/cleanup', methods=['POST'])
+def cleanup_campaign():
+    target_campaign = request.json.get('campaign_name')
+    delete_files = request.json.get('delete_files', False)
+    archive_mode = request.json.get('archive', False) 
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    if not target_campaign:
+        return jsonify({'error': 'Campaign name required'}), 400
+
+    print(f"--- CLEANUP CAMPAIGN: {target_campaign} (Delete files: {delete_files}, Archive: {archive_mode}) ---")
+    
+    # 1. STOP PROCESS (Kill Switch)
+    if target_campaign in ACTIVE_CAMPAIGNS:
+        del ACTIVE_CAMPAIGNS[target_campaign]
+    STOP_FLAGS[target_campaign] = True
+    
+    if not archive_mode and not delete_files:
+        log_system("WARNING", f"Campaign '{target_campaign}' force-stopped. Data preserved in DB.")
+        return jsonify({'status': 'ok', 'action': 'stopped_only'})
+    
+    # 3. ARCHIVE/DELETE LOGIC (Only if requested)
+    # Only target conversations in the current project
+    rows = execute_query("SELECT id, campaign_name FROM conversations WHERE campaign_name LIKE ? AND project_id=?", (f"%{target_campaign}%", project_id), fetch_all=True)
+    
+    conv_count = 0
+    for row in rows:
+        c_id = row['id']
+        c_name_str = row['campaign_name']
+        if not c_name_str: continue
+        
+        # Split current campaigns
+        campaigns = [c.strip() for c in c_name_str.split('|') if c.strip()]
+        
+        if target_campaign in campaigns:
+            # Remove the campaign tag
+            campaigns.remove(target_campaign)
+            
+            if delete_files:
+                # User wants to delete history
+                if not campaigns:
+                    # Belongs ONLY to this campaign -> Delete
+                    execute_query("DELETE FROM conversations WHERE id=?", (c_id,), commit=True)
+                    execute_query("DELETE FROM messages WHERE conversation_id=?", (c_id,), commit=True)
+                else:
+                    # Belongs to others too -> Just update tag
+                    new_val = ' | '.join(campaigns)
+                    execute_query("UPDATE conversations SET campaign_name=? WHERE id=?", (new_val, c_id), commit=True)
+            else:
+                # Keep history, just untag
+                new_val = ' | '.join(campaigns)
+                execute_query("UPDATE conversations SET campaign_name=? WHERE id=?", (new_val, c_id), commit=True)
+                
+            conv_count += 1
+
+    # 4. Clean RECIPIENTS (Leads)
+    # Unlink client from campaign -> 'Manual'
+    execute_query("UPDATE recipients SET campaign_name='Manual' WHERE campaign_name=? AND project_id=?", (target_campaign, project_id), commit=True)
+
+    return jsonify({'status': 'ok', 'updated_count': conv_count})
+
+@app.route('/api/messages/<id>', methods=['GET'])
+def get_messages(id):
+    if '_' not in id: return jsonify([])
+    
+    owner_id, peer_id = id.split('_')
+    # Use owner_id to find account, logic remains same
+    acc = execute_query("SELECT access_token, vk_user_id FROM accounts WHERE id=?", (owner_id,), fetch_one=True)
+    
+    if acc:
+        try:
+            res = vk_api_call('messages.getHistory', {'peer_id': peer_id, 'count': 20}, acc['access_token'])
+            if 'response' in res:
+                my_id = str(acc['vk_user_id'])
+                items = res['response']['items']
+                
+                if items:
+                    real_vk_ids = [item['id'] for item in items]
+                    min_date = min([item['date'] for item in items])
+                    
+                    if real_vk_ids:
+                        placeholders = ','.join('?' * len(real_vk_ids))
+                        cleanup_query = f"DELETE FROM messages WHERE conversation_id=? AND date >= ? AND id NOT IN ({placeholders})"
+                        execute_query(cleanup_query, (id, min_date, *real_vk_ids), commit=True)
+
+                    for item in items:
+                        sender = 'me' if str(item['from_id']) == my_id else 'them'
+                        txt = parse_full_message_text(item)
+                        atts = serialize_attachments(item.get('attachments'))
+                        
+                        execute_query("INSERT OR REPLACE INTO messages (id, conversation_id, sender, text, date, attachments) VALUES (?, ?, ?, ?, ?, ?)",
+                                     (item['id'], id, sender, txt, item['date'], atts), commit=True)
+                                 
+                execute_query("UPDATE conversations SET unread_count=0 WHERE id=?", (id,), commit=True)
+        except Exception as e:
+            print(f"Msg sync error: {e}")
+        
+    msgs = execute_query("SELECT * FROM messages WHERE conversation_id=? ORDER BY date ASC", (id,), fetch_all=True)
+    
+    results = []
+    for r in msgs:
+        d = dict(r)
+        if d.get('attachments'):
+            try: d['attachments'] = json.loads(d['attachments'])
+            except: d['attachments'] = []
+        else: d['attachments'] = []
+        results.append(d)
+
+    return jsonify(results)
+
+@app.route('/api/messages/<id>/attachments', methods=['GET'])
+def get_chat_attachments(id):
+    """Aggregate all attachments from a conversation."""
+    try:
+        rows = execute_query("SELECT attachments, date FROM messages WHERE conversation_id=? AND attachments IS NOT NULL AND attachments != '' ORDER BY date DESC", (id,), fetch_all=True)
+        all_attachments = []
+        
+        for r in rows:
+            try:
+                atts = json.loads(r['attachments'])
+                for att in atts:
+                    att['date'] = r['date']
+                    all_attachments.append(att)
+            except:
+                pass
+                
+        return jsonify(all_attachments)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/conversations/<id>/reminders', methods=['GET', 'POST'])
+def manage_reminders(id):
+    if request.method == 'POST':
+        try:
+            d = request.json
+            remind_at = int(d.get('remind_at', 0))
+            note = d.get('note', '')
+            created_at = int(time.time())
+            
+            execute_query("INSERT INTO reminders (conversation_id, remind_at, note, created_at) VALUES (?, ?, ?, ?)", 
+                          (id, remind_at, note, created_at), commit=True)
+            return jsonify({'status': 'created'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+            
+    # GET
+    rows = execute_query("SELECT * FROM reminders WHERE conversation_id=? ORDER BY remind_at ASC", (id,), fetch_all=True)
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/reminders/<int:id>', methods=['DELETE'])
+def delete_reminder(id):
+    execute_query("DELETE FROM reminders WHERE id=?", (id,), commit=True)
+    return jsonify({'status': 'deleted'})
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    
+    owner_id = request.form.get('owner_id')
+    # If no owner_id, use project to find default
+    project_id = request.headers.get('X-Project-Id', 1)
+    
+    if owner_id:
+        acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (owner_id,), fetch_one=True)
+    else:
+        acc = execute_query("SELECT access_token FROM accounts WHERE status='OK' AND project_id=? LIMIT 1", (project_id,), fetch_one=True)
+        
+    if not acc: return jsonify({'error': 'No active account for upload'}), 400
+    
+    attachment_id = upload_file_to_vk(acc['access_token'], file)
+    
+    if attachment_id: return jsonify({'status': 'ok', 'attachment': attachment_id})
+    else: return jsonify({'error': 'Upload failed'}), 500
+
+@app.route('/api/send-message', methods=['POST'])
+def send_private_message():
+    d = request.json
+    rec_id = d.get('recipientId')
+    text = d.get('message', '')
+    attachments = d.get('attachments', []) 
+    
+    if not rec_id or '_' not in rec_id: return jsonify({'error': 'Bad ID'}), 400
+    oid, pid = rec_id.split('_')
+    
+    acc = execute_query("SELECT access_token FROM accounts WHERE id=?", (oid,), fetch_one=True)
+    if not acc: return jsonify({'error': 'Account not found'}), 404
+    
+    params = {'peer_id': pid, 'message': text, 'random_id': 0}
+    if attachments: params['attachment'] = ",".join(attachments)
+    
+    res = vk_api_call('messages.send', params, acc['access_token'])
+    if 'error' in res: return jsonify({'error': res['error']['error_msg']}), 400
+    
+    msg_id = res['response']
+    
+    preview_text = text
+    if not text and attachments: preview_text = f"[Вложение]"
+    
+    execute_query("UPDATE conversations SET last_message=?, unread_count=0 WHERE id=?", (preview_text, rec_id), commit=True)
+    execute_query("INSERT OR REPLACE INTO messages (id, conversation_id, sender, text, date) VALUES (?, ?, 'me', ?, ?)",
+                 (msg_id, rec_id, text, int(time.time())), commit=True)
+                 
+    return jsonify({'status': 'sent', 'id': msg_id})
